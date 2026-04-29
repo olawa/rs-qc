@@ -1,4 +1,5 @@
 use crate::analysis::bam_scan::{scan_bam_stream, BamScanConfig};
+use crate::analysis::report::write_summary_json;
 use anyhow::{bail, Context, Result};
 use noodles::bam;
 use noodles::sam;
@@ -280,6 +281,12 @@ fn write_outputs(config: &AlignmentQcConfig, metrics: &AlignmentQcMetrics) -> Re
     write_cigar(config, metrics)?;
     write_contigs(config, metrics)?;
     write_accuracy_hist(config, metrics)?;
+    write_summary_json(
+        &format!("{}.align.summary.json", config.output_prefix),
+        "align",
+        &config.output_prefix,
+        metrics,
+    )?;
     Ok(())
 }
 

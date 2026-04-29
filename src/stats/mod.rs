@@ -193,7 +193,11 @@ pub fn aggregate_rseqc_classic(
         "  - Gene body coverage: {} genes passed min_support={}{}",
         total_genes,
         min_support,
-        if coverage_weighted { " (coverage-weighted)" } else { "" }
+        if coverage_weighted {
+            " (coverage-weighted)"
+        } else {
+            ""
+        }
     );
 
     let raw_means: Vec<f64> = profile_sums.iter().map(|&s| s / total_weight).collect();
@@ -234,9 +238,9 @@ pub fn aggregate_rseqc_stratified(
 ) -> HashMap<String, Vec<f64>> {
     // (label, lower_inclusive_bp, upper_exclusive_bp)
     const BINS: &[(&str, u32, u32)] = &[
-        ("short (<1.5kb)",       0,      1_500),
-        ("medium (1.5-5kb)",  1_500,     5_001),
-        ("long (5-10kb)",     5_001,    10_001),
+        ("short (<1.5kb)", 0, 1_500),
+        ("medium (1.5-5kb)", 1_500, 5_001),
+        ("long (5-10kb)", 5_001, 10_001),
         ("very long (>10kb)", 10_001, u32::MAX),
     ];
 

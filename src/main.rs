@@ -8,21 +8,26 @@ use crate::analysis::alignment_qc::{
 };
 use crate::analysis::bam_scan::{find_bai_path, generate_windows};
 use crate::analysis::contamination::ContaminantIndex;
+use crate::analysis::dna_qc::{run_dna_qc, DnaQcConfig};
 use crate::analysis::fastq_qc::{run_fastq_qc, sample_name_from_path, FastqQcConfig};
 use crate::analysis::feature_index::FeatureIndex;
 use crate::analysis::index::{AnnotationIndex, DenseMap};
 use crate::analysis::qc::{InlineQcState, ReadEndObservation};
 use crate::analysis::read_distribution::RegionType;
+use crate::analysis::report::{
+    build_document, resolve_input_files, write_report, write_summary_json,
+};
 use crate::analysis::types::AnalysisType;
-use crate::io::annotation::{load_annotation, load_genes, AnnotationConfig, AnnotationFormat, IsoformSelect};
+use crate::io::annotation::{
+    load_annotation, load_genes, AnnotationConfig, AnnotationFormat, IsoformSelect,
+};
 use crate::models::{normalize_chrom, Gene};
 use crate::stats::plotting::{
     generate_gene_body_plot, generate_multi_3p_dist_plot, generate_multi_inner_distance_plot,
     generate_stratified_gene_body_plot,
 };
 use crate::stats::{
-    aggregate_genes, aggregate_rseqc_classic, aggregate_rseqc_stratified,
-    write_classic_wide_format,
+    aggregate_genes, aggregate_rseqc_classic, aggregate_rseqc_stratified, write_classic_wide_format,
 };
 use anyhow::{bail, Result};
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
@@ -199,13 +204,13 @@ enum Commands {
     /// General alignment QC for BAM/CRAM files.
     Align(AlignArgs),
     /// DNA coverage QC with mosdepth-like depth and breadth metrics.
-    Dna(PlannedArgs),
+    Dna(DnaArgs),
     /// ATAC/ChIP/cfDNA-style assay metrics.
     Atac(PlannedArgs),
     /// Contamination metrics from aligned intervals, contigs, and optional k-mer screens.
     Contam(PlannedArgs),
     /// Render JSON/TSV/SVG metrics into a unified report.
-    Report(PlannedArgs),
+    Report(ReportArgs),
 }
 
 #[derive(ClapArgs, Debug)]
@@ -213,6 +218,28 @@ struct PlannedArgs {
     /// Output prefix for future module outputs.
     #[arg(short, long, default_value = "rs-qc")]
     output: String,
+}
+
+#[derive(ClapArgs, Debug)]
+struct DnaArgs {
+    #[arg(short, long, num_args = 1..)]
+    input: Vec<String>,
+    #[arg(short, long)]
+    output: Option<String>,
+    #[arg(long, default_value_t = 100_000)]
+    window_size: usize,
+    #[arg(long)]
+    targets: Option<String>,
+    #[arg(short, long, default_value_t = 8)]
+    threads: usize,
+}
+
+#[derive(ClapArgs, Debug)]
+struct ReportArgs {
+    #[arg(short, long, num_args = 1.., required = true)]
+    input: Vec<String>,
+    #[arg(short, long)]
+    output: Option<String>,
 }
 
 #[derive(ClapArgs, Debug)]
@@ -491,10 +518,10 @@ fn main() -> Result<()> {
         Commands::Rna(args) => run_rna(args),
         Commands::Fastq(args) => run_fastq(args),
         Commands::Align(args) => run_align(args),
-        Commands::Dna(args) => planned_subcommand("dna", &args),
+        Commands::Dna(args) => run_dna(args),
         Commands::Atac(args) => planned_subcommand("atac", &args),
         Commands::Contam(args) => planned_subcommand("contam", &args),
-        Commands::Report(args) => planned_subcommand("report", &args),
+        Commands::Report(args) => run_report(args),
     }
 }
 
@@ -594,6 +621,57 @@ fn run_fastq(args: FastqArgs) -> Result<()> {
     Ok(())
 }
 
+fn run_dna(args: DnaArgs) -> Result<()> {
+    let output_prefix = args.output.unwrap_or_else(|| {
+        if args.input.len() == 1 {
+            sample_name_from_alignment_path(&args.input[0])
+        } else {
+            "rs-qc".to_string()
+        }
+    });
+
+    println!("--------------------------------------------------");
+    println!("rs-qc dna v{}", env!("CARGO_PKG_VERSION"));
+    println!("--------------------------------------------------");
+    println!("Scanning {} BAM input(s).", args.input.len());
+
+    let config = DnaQcConfig {
+        inputs: args.input,
+        output_prefix: output_prefix.clone(),
+        window_size: args.window_size,
+        target_bed: args.targets,
+        threads: args.threads,
+        show_progress: true,
+    };
+
+    let metrics = run_dna_qc(&config)?;
+    println!("  - Records: {}", metrics.total_records);
+    println!("  - Mapped: {}", metrics.mapped_records);
+    println!("  - Mean depth: {:.4}", metrics.summary().mean_depth);
+    println!(
+        "  - Summary written to: {}.dna.summary.tsv / .json",
+        output_prefix
+    );
+    Ok(())
+}
+
+fn run_report(args: ReportArgs) -> Result<()> {
+    let output_prefix = args.output.unwrap_or_else(|| "rs-qc-report".to_string());
+    println!("--------------------------------------------------");
+    println!("rs-qc report v{}", env!("CARGO_PKG_VERSION"));
+    println!("--------------------------------------------------");
+    println!("Collecting summary JSON files...");
+
+    let sources = resolve_input_files(&args.input)?;
+    println!("  - Found {} summary file(s).", sources.len());
+
+    let document = build_document(&sources)?;
+    write_report(&document, &output_prefix)?;
+    println!("  - Summary written to: {}.summary.json", output_prefix);
+    println!("  - HTML report written to: {}.report.html", output_prefix);
+    Ok(())
+}
+
 fn percent(n: u64, total: u64) -> f64 {
     if total == 0 {
         0.0
@@ -628,9 +706,9 @@ fn run_rna(args: RnaArgs) -> Result<()> {
         transcript_centric: args.transcript_centric,
         plus_strand_only: args.plus,
         isoform_select: match args.isoform_select {
-            IsoformSelectMode::Longest  => IsoformSelect::Longest,
+            IsoformSelectMode::Longest => IsoformSelect::Longest,
             IsoformSelectMode::Shortest => IsoformSelect::Shortest,
-            IsoformSelectMode::Median   => IsoformSelect::Median,
+            IsoformSelectMode::Median => IsoformSelect::Median,
         },
         strict_cluster: args.strict_cluster,
     };
@@ -1096,14 +1174,10 @@ fn run_rna(args: RnaArgs) -> Result<()> {
                             args.output, sample_name
                         );
                         generate_stratified_gene_body_plot(&strat, &strat_path)?;
-                        println!(
-                            "  - Length-stratified plot written to: {}",
-                            strat_path
-                        );
+                        println!("  - Length-stratified plot written to: {}", strat_path);
                     }
                 }
             }
-
 
             if args.analysis.contains(&AnalysisType::ThreePrime) {
                 let stats = aggregate_genes(
@@ -1124,6 +1198,8 @@ fn run_rna(args: RnaArgs) -> Result<()> {
                 qc.rdna_reads = total_state.rdna_reads;
                 let qc_summary_path = format!("{}.{}.rna_qc.txt", args.output, sample_name);
                 qc.write_summary_file(&qc_summary_path)?;
+                let qc_json_path = format!("{}.{}.rna.summary.json", args.output, sample_name);
+                write_summary_json(&qc_json_path, "rna", &sample_name, &qc)?;
                 println!("  - RNA-seq QC summary written to: {}", qc_summary_path);
                 println!(
                     "    - mtDNA reads: {} ({:.2}%)",

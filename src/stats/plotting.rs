@@ -61,12 +61,12 @@ pub fn generate_stratified_gene_body_plot(
 ) -> Result<()> {
     // Fixed colour per length class — must match the labels in aggregate_rseqc_stratified.
     let colour_map: &[(&str, &str)] = &[
-        ("short (<1.5kb)",      "#2196F3"),   // blue
-        ("medium (1.5-5kb)",    "#009688"),   // teal
-        ("long (5-10kb)",       "#FF9800"),   // orange
-        ("very long (>10kb)",   "#F44336"),   // red
+        ("short (<1.5kb)", "#2196F3"),    // blue
+        ("medium (1.5-5kb)", "#009688"),  // teal
+        ("long (5-10kb)", "#FF9800"),     // orange
+        ("very long (>10kb)", "#F44336"), // red
     ];
-    let fallback_colour = "#9E9E9E";          // grey for unexpected keys
+    let fallback_colour = "#9E9E9E"; // grey for unexpected keys
 
     // Preserve biological order rather than alphabetical sort.
     let ordered_keys: Vec<&str> = colour_map
@@ -110,7 +110,6 @@ pub fn generate_stratified_gene_body_plot(
 
     Ok(())
 }
-
 
 /// Generates a combined Multi-Sample plot for 3' Distance Bias.
 pub fn generate_multi_3p_dist_plot(

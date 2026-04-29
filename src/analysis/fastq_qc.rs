@@ -1,5 +1,7 @@
+use crate::analysis::report::write_summary_json;
 use anyhow::{bail, Context, Result};
 use flate2::read::MultiGzDecoder;
+use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
@@ -46,11 +48,47 @@ pub struct FastqQcMetrics {
     pub paired_name_mismatches: u64,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct BasePositionMetrics {
     pub count: u64,
     pub qual_sum: u64,
     pub bases: [u64; 5],
+}
+
+#[derive(Debug, Serialize)]
+pub struct FastqKmerCount {
+    pub kmer: String,
+    pub count: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FastqOverrepresented {
+    pub sequence: String,
+    pub count: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FastqQcSummary {
+    pub total_reads: u64,
+    pub total_bases: u64,
+    pub min_len: usize,
+    pub max_len: usize,
+    pub mean_read_length: f64,
+    pub length_hist: BTreeMap<usize, u64>,
+    pub gc_hist: BTreeMap<u8, u64>,
+    pub mean_quality_hist: BTreeMap<u8, u64>,
+    pub adapter_hits: BTreeMap<String, u64>,
+    pub overrepresented: Vec<FastqOverrepresented>,
+    pub kmers: Vec<FastqKmerCount>,
+    pub duplicate_sample_reads: u64,
+    pub duplicate_sample_unique: u64,
+    pub duplication_estimate: f64,
+    pub poly_a_reads: u64,
+    pub poly_g_reads: u64,
+    pub n_reads: u64,
+    pub paired_reads_checked: u64,
+    pub paired_name_mismatches: u64,
+    pub per_base: Vec<BasePositionMetrics>,
 }
 
 impl FastqQcMetrics {
@@ -184,6 +222,55 @@ impl FastqQcMetrics {
             1.0 - (self.duplicate_sample_unique as f64 / self.duplicate_sample_reads as f64)
         }
     }
+
+    pub fn summary(&self) -> FastqQcSummary {
+        let mut overrepresented: Vec<_> = self
+            .overrepresented
+            .iter()
+            .map(|(sequence, &count)| FastqOverrepresented {
+                sequence: sequence.clone(),
+                count,
+            })
+            .collect();
+        overrepresented.sort_by(|a, b| {
+            b.count
+                .cmp(&a.count)
+                .then_with(|| a.sequence.cmp(&b.sequence))
+        });
+
+        let mut kmers: Vec<_> = self
+            .kmers
+            .iter()
+            .map(|(kmer, &count)| FastqKmerCount {
+                kmer: String::from_utf8_lossy(kmer).to_string(),
+                count,
+            })
+            .collect();
+        kmers.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.kmer.cmp(&b.kmer)));
+
+        FastqQcSummary {
+            total_reads: self.total_reads,
+            total_bases: self.total_bases,
+            min_len: self.min_len,
+            max_len: self.max_len,
+            mean_read_length: self.mean_read_length(),
+            length_hist: self.length_hist.clone(),
+            gc_hist: self.gc_hist.clone(),
+            mean_quality_hist: self.mean_quality_hist.clone(),
+            adapter_hits: self.adapter_hits.clone(),
+            overrepresented,
+            kmers,
+            duplicate_sample_reads: self.duplicate_sample_reads,
+            duplicate_sample_unique: self.duplicate_sample_unique,
+            duplication_estimate: self.duplication_estimate(),
+            poly_a_reads: self.poly_a_reads,
+            poly_g_reads: self.poly_g_reads,
+            n_reads: self.n_reads,
+            paired_reads_checked: self.paired_reads_checked,
+            paired_name_mismatches: self.paired_name_mismatches,
+            per_base: self.per_base.clone(),
+        }
+    }
 }
 
 pub fn run_fastq_qc(config: &FastqQcConfig) -> Result<FastqQcMetrics> {
@@ -311,6 +398,7 @@ fn open_fastq(path: &str) -> Result<Box<dyn BufRead>> {
 }
 
 fn write_outputs(config: &FastqQcConfig, metrics: &FastqQcMetrics) -> Result<()> {
+    let summary = metrics.summary();
     write_summary(config, metrics)?;
     write_per_base(config, metrics)?;
     write_histogram(
@@ -354,6 +442,12 @@ fn write_outputs(config: &FastqQcConfig, metrics: &FastqQcMetrics) -> Result<()>
             .iter()
             .map(|(k, &v)| (std::str::from_utf8(k).unwrap_or("N"), v)),
         config.top_n,
+    )?;
+    write_summary_json(
+        &format!("{}.fastq.summary.json", config.output_prefix),
+        "fastq",
+        &config.output_prefix,
+        &summary,
     )?;
     Ok(())
 }

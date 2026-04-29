@@ -34,6 +34,7 @@ The project intentionally starts with a strong RNA-seq core, but the shape is br
 - `rs-qc fastq` for streaming FASTQ QC
 - `rs-qc align` for general BAM/CRAM alignment QC
 - `rs-qc rna` for RNA-seq QC with RSeQC-style metrics
+- `rs-qc report` for unified JSON and HTML reporting
 
 The CLI also exposes planned subcommands for future expansion:
 
@@ -120,12 +121,17 @@ Each module writes plain-text or TSV outputs with the chosen output prefix.
 Examples:
 
 - `sample.fastq.summary.txt`
+- `sample.fastq.summary.json`
 - `sample.fastq.per_base.tsv`
 - `sample.align.summary.txt`
+- `sample.align.summary.json`
 - `sample.align.mapq.tsv`
 - `sample.rna_qc.txt`
+- `sample.rna.summary.json`
 - `sample.inner_distance.tsv`
 - `sample.geneBodyCoverage.txt`
+- `sample.summary.json`
+- `sample.report.html`
 
 This structured output is intentional: it makes the future JSON and HTML report layer much easier to build without re-running the scan.
 

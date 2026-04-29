@@ -1,3 +1,4 @@
+use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::File;
 use std::io::Write;
@@ -11,7 +12,7 @@ pub struct ReadEndObservation {
     pub is_reverse: bool,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize)]
 pub struct RnaSeqQcSummary {
     pub aligned_qc_reads: u64,
     pub mtdna_reads: u64,

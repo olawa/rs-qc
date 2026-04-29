@@ -49,6 +49,20 @@ Useful options:
 - `--rdna-bed` for explicit rDNA interval annotation
 - `--rdna-contigs` for contig-name-based rDNA detection
 
+## Report
+
+Render a unified JSON and HTML report from existing module summaries.
+
+```bash
+rs-qc report -i sample_fastq sample_align sample_rna -o sample_report
+```
+
+Useful inputs:
+
+- an output prefix like `sample_fastq`
+- a summary JSON path like `sample.fastq.summary.json`
+- a mix of module prefixes and summary JSON files
+
 ## Planned Modules
 
 These are exposed in the CLI shell already, but are not implemented yet:
@@ -56,7 +70,6 @@ These are exposed in the CLI shell already, but are not implemented yet:
 - `rs-qc dna`
 - `rs-qc atac`
 - `rs-qc contam`
-- `rs-qc report`
 
 ## Output
 
