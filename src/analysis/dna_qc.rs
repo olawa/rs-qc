@@ -146,11 +146,11 @@ impl DnaQcMetrics {
             total_reference_bases: self.total_reference_bases,
             mean_depth,
             median_depth,
-            breadth_1x: breadth(1),
-            breadth_5x: breadth(5),
-            breadth_10x: breadth(10),
-            breadth_20x: breadth(20),
-            breadth_30x: breadth(30),
+            breadth_1x: breadth(BREADTH_THRESHOLDS[0]),
+            breadth_5x: breadth(BREADTH_THRESHOLDS[1]),
+            breadth_10x: breadth(BREADTH_THRESHOLDS[2]),
+            breadth_20x: breadth(BREADTH_THRESHOLDS[3]),
+            breadth_30x: breadth(BREADTH_THRESHOLDS[4]),
             depth_hist: self.depth_hist.clone(),
             contigs: self.contigs.values().cloned().collect(),
             windows: self.windows.values().cloned().collect(),
@@ -322,10 +322,12 @@ impl DnaCoverageState {
         };
         let mut reference_lengths = HashMap::new();
         let mut windows_by_chrom: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut total_reference_bases = 0_u64;
 
         for (name, seq) in header.reference_sequences() {
             let chrom = normalize_chrom(String::from_utf8_lossy(name.as_ref()).as_ref());
             let length = seq.length().get() as u64;
+            total_reference_bases += length;
             reference_lengths.insert(chrom.clone(), length);
             metrics.contigs.insert(
                 chrom.clone(),
@@ -355,6 +357,9 @@ impl DnaCoverageState {
             }
             windows_by_chrom.insert(chrom, windows);
         }
+
+        metrics.total_reference_bases = total_reference_bases;
+        metrics.depth_hist.insert(0, total_reference_bases);
 
         let mut targets_by_chrom: BTreeMap<String, Vec<String>> = BTreeMap::new();
         if let Some(path) = target_bed {
@@ -533,7 +538,12 @@ impl DnaCoverageState {
         }
 
         let len = end - start;
-        self.metrics.total_reference_bases += len;
+        if depth == 0 {
+            return;
+        }
+        if let Some(zero) = self.metrics.depth_hist.get_mut(&0) {
+            *zero = zero.saturating_sub(len);
+        }
         *self.metrics.depth_hist.entry(depth).or_insert(0) += len;
 
         if let Some(contig) = self.metrics.contigs.get_mut(chrom) {

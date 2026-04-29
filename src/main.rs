@@ -645,9 +645,10 @@ fn run_dna(args: DnaArgs) -> Result<()> {
     };
 
     let metrics = run_dna_qc(&config)?;
+    let summary = metrics.summary();
     println!("  - Records: {}", metrics.total_records);
     println!("  - Mapped: {}", metrics.mapped_records);
-    println!("  - Mean depth: {:.4}", metrics.summary().mean_depth);
+    println!("  - Mean depth: {:.4}", summary.mean_depth);
     println!(
         "  - Summary written to: {}.dna.summary.tsv / .json",
         output_prefix

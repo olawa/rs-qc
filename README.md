@@ -34,6 +34,7 @@ The project intentionally starts with a strong RNA-seq core, but the shape is br
 - `rs-qc fastq` for streaming FASTQ QC
 - `rs-qc align` for general BAM/CRAM alignment QC
 - `rs-qc rna` for RNA-seq QC with RSeQC-style metrics
+- `rs-qc dna` for mosdepth-like coverage and breadth QC
 - `rs-qc report` for unified JSON and HTML reporting
 
 The CLI also exposes planned subcommands for future expansion:
@@ -114,6 +115,12 @@ rs-qc rna \
   --analysis gene-body,three-prime,distribution,qc
 ```
 
+### DNA coverage
+
+```bash
+rs-qc dna -i sample.bam -o sample_dna --window-size 100000 --targets panel.bed
+```
+
 ## Output Files
 
 Each module writes plain-text or TSV outputs with the chosen output prefix.
@@ -132,6 +139,12 @@ Examples:
 - `sample.geneBodyCoverage.txt`
 - `sample.summary.json`
 - `sample.report.html`
+- `sample.dna.summary.tsv`
+- `sample.dna.summary.json`
+- `sample.dna.depth_hist.tsv`
+- `sample.dna.contigs.tsv`
+- `sample.dna.windows.tsv`
+- `sample.dna.targets.tsv`
 
 This structured output is intentional: it makes the future JSON and HTML report layer much easier to build without re-running the scan.
 
@@ -149,13 +162,14 @@ Planned next steps include:
 - `rs-qc dna` with mosdepth-like coverage metrics
 - `rs-qc contam` with contaminant and species screening
 - `rs-qc atac` for ATAC/ChIP-style metrics
-- `rs-qc report` for unified JSON and HTML reporting
+- richer HTML report cards and warning badges
 
 ## Notes
 
 - Input FASTQ files can be gzipped.
 - BAM input is currently the most mature alignment path.
 - CRAM support is planned, but BAM is the current focus.
+- DNA coverage uses a simple coordinate-sweep accumulator, not the RNA transcript index.
 
 ## More Docs
 

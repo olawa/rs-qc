@@ -107,45 +107,47 @@ pub fn resolve_input_files(inputs: &[String]) -> Result<Vec<PathBuf>> {
     for input in inputs {
         let path = Path::new(input);
         if path.exists() && path.extension().and_then(|e| e.to_str()) == Some("json") {
-            files.push(path.to_path_buf());
+            push_unique(&mut files, path.to_path_buf());
             continue;
         }
 
+        let mut found_any = false;
         let candidates = [
             format!("{input}.fastq.summary.json"),
             format!("{input}.align.summary.json"),
+            format!("{input}.dna.summary.json"),
             format!("{input}.rna.summary.json"),
             format!("{input}.summary.json"),
         ];
 
-        let mut found = false;
         for candidate in candidates {
             let candidate_path = PathBuf::from(&candidate);
             if candidate_path.exists() {
-                files.push(candidate_path);
-                found = true;
+                push_unique(&mut files, candidate_path);
+                found_any = true;
             }
         }
 
-        if !found {
-            let parent = path.parent().unwrap_or_else(|| Path::new("."));
-            let prefix = path.file_name().and_then(|s| s.to_str()).unwrap_or(input);
-            for entry in fs::read_dir(parent)
-                .with_context(|| format!("could not read directory {}", parent.display()))?
-            {
-                let entry = entry?;
-                let candidate_path = entry.path();
-                let Some(name) = candidate_path.file_name().and_then(|s| s.to_str()) else {
-                    continue;
-                };
-                if name.starts_with(prefix) && name.ends_with(".summary.json") {
-                    files.push(candidate_path);
-                    found = true;
-                }
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let prefix = path.file_name().and_then(|s| s.to_str()).unwrap_or(input);
+        for entry in fs::read_dir(parent)
+            .with_context(|| format!("could not read directory {}", parent.display()))?
+        {
+            let entry = entry?;
+            let candidate_path = entry.path();
+            let Some(name) = candidate_path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if name.starts_with(prefix) && name.ends_with(".summary.json") {
+                push_unique(&mut files, candidate_path);
+                found_any = true;
             }
         }
 
-        if !found {
+        if !found_any {
             bail!(
                 "could not find a summary JSON for input `{input}`; pass a summary .json file or an output prefix"
             );
@@ -153,6 +155,16 @@ pub fn resolve_input_files(inputs: &[String]) -> Result<Vec<PathBuf>> {
     }
 
     Ok(files)
+}
+
+fn push_unique(files: &mut Vec<PathBuf>, candidate: PathBuf) {
+    let normalized = fs::canonicalize(&candidate).unwrap_or(candidate);
+    if !files
+        .iter()
+        .any(|existing| fs::canonicalize(existing).ok().as_ref() == Some(&normalized))
+    {
+        files.push(normalized);
+    }
 }
 
 fn render_html(document: &ReportDocument) -> String {
@@ -257,37 +269,45 @@ fn overview_module_counts(document: &ReportDocument) -> Vec<(String, usize)> {
 
 fn artifact_links(section: &ReportSection) -> Vec<(String, String)> {
     let source = Path::new(&section.source);
-    let Some(stem) = source.file_stem().and_then(|s| s.to_str()) else {
+    let Some(prefix) = summary_prefix_from_path(source) else {
         return Vec::new();
     };
     let dir = source.parent().unwrap_or_else(|| Path::new("."));
     let candidates = match section.module.as_str() {
         "fastq" => vec![
-            format!("{stem}.fastq.summary.json"),
-            format!("{stem}.fastq.summary.txt"),
-            format!("{stem}.fastq.per_base.tsv"),
-            format!("{stem}.fastq.length_distribution.tsv"),
-            format!("{stem}.fastq.gc_distribution.tsv"),
-            format!("{stem}.fastq.mean_quality_distribution.tsv"),
-            format!("{stem}.fastq.overrepresented.tsv"),
-            format!("{stem}.fastq.kmers.tsv"),
+            format!("{prefix}.fastq.summary.json"),
+            format!("{prefix}.fastq.summary.txt"),
+            format!("{prefix}.fastq.per_base.tsv"),
+            format!("{prefix}.fastq.length_distribution.tsv"),
+            format!("{prefix}.fastq.gc_distribution.tsv"),
+            format!("{prefix}.fastq.mean_quality_distribution.tsv"),
+            format!("{prefix}.fastq.overrepresented.tsv"),
+            format!("{prefix}.fastq.kmers.tsv"),
         ],
         "align" => vec![
-            format!("{stem}.align.summary.json"),
-            format!("{stem}.align.summary.txt"),
-            format!("{stem}.align.mapq.tsv"),
-            format!("{stem}.align.read_length.tsv"),
-            format!("{stem}.align.insert_size.tsv"),
-            format!("{stem}.align.cigar.tsv"),
-            format!("{stem}.align.contigs.tsv"),
-            format!("{stem}.align.de_accuracy.tsv"),
+            format!("{prefix}.align.summary.json"),
+            format!("{prefix}.align.summary.txt"),
+            format!("{prefix}.align.mapq.tsv"),
+            format!("{prefix}.align.read_length.tsv"),
+            format!("{prefix}.align.insert_size.tsv"),
+            format!("{prefix}.align.cigar.tsv"),
+            format!("{prefix}.align.contigs.tsv"),
+            format!("{prefix}.align.de_accuracy.tsv"),
+        ],
+        "dna" => vec![
+            format!("{prefix}.dna.summary.json"),
+            format!("{prefix}.dna.summary.tsv"),
+            format!("{prefix}.dna.depth_hist.tsv"),
+            format!("{prefix}.dna.contigs.tsv"),
+            format!("{prefix}.dna.windows.tsv"),
+            format!("{prefix}.dna.targets.tsv"),
         ],
         "rna" => vec![
-            format!("{stem}.rna.summary.json"),
-            format!("{stem}.rna_qc.txt"),
-            format!("{stem}.inner_distance.tsv"),
-            format!("{stem}.geneBodyCoverage.txt"),
-            format!("{stem}.geneBodyCoverage.svg"),
+            format!("{prefix}.rna.summary.json"),
+            format!("{prefix}.rna_qc.txt"),
+            format!("{prefix}.inner_distance.tsv"),
+            format!("{prefix}.geneBodyCoverage.txt"),
+            format!("{prefix}.geneBodyCoverage.svg"),
         ],
         _ => Vec::new(),
     };
@@ -303,6 +323,22 @@ fn artifact_links(section: &ReportSection) -> Vec<(String, String)> {
             }
         })
         .collect()
+}
+
+fn summary_prefix_from_path(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    for suffix in [
+        ".fastq.summary.json",
+        ".align.summary.json",
+        ".rna.summary.json",
+        ".dna.summary.json",
+        ".summary.json",
+    ] {
+        if let Some(prefix) = name.strip_suffix(suffix) {
+            return Some(prefix.to_string());
+        }
+    }
+    None
 }
 
 fn flatten_summary(value: &Value, prefix: &str) -> Vec<(String, String)> {
@@ -365,6 +401,8 @@ fn infer_module_from_path(path: &Path) -> &str {
         "fastq"
     } else if name.contains(".align.summary.json") {
         "align"
+    } else if name.contains(".dna.summary.json") {
+        "dna"
     } else if name.contains(".rna.summary.json") {
         "rna"
     } else if name.contains(".rna") {
@@ -396,6 +434,7 @@ mod tests {
 
         let fastq_path = tmp.path().join("sample.fastq.summary.json");
         let align_path = tmp.path().join("sample.align.summary.json");
+        let dna_path = tmp.path().join("sample.dna.summary.json");
         let rna_path = tmp.path().join("sample.rna.summary.json");
 
         write_summary_json(
@@ -413,6 +452,13 @@ mod tests {
         )
         .expect("write align summary");
         write_summary_json(
+            dna_path.to_str().unwrap(),
+            "dna",
+            "sample",
+            &json!({"total_records": 40, "mean_depth": 30.5}),
+        )
+        .expect("write dna summary");
+        write_summary_json(
             rna_path.to_str().unwrap(),
             "rna",
             "sample",
@@ -421,12 +467,13 @@ mod tests {
         .expect("write rna summary");
 
         let files = resolve_input_files(&["sample".to_string()]).expect("resolve prefix");
-        assert_eq!(files.len(), 3);
+        assert_eq!(files.len(), 4);
 
         let document = build_document(&files).expect("build document");
-        assert_eq!(document.sections.len(), 3);
+        assert_eq!(document.sections.len(), 4);
         assert!(document.sections.iter().any(|s| s.module == "fastq"));
         assert!(document.sections.iter().any(|s| s.module == "align"));
+        assert!(document.sections.iter().any(|s| s.module == "dna"));
         assert!(document.sections.iter().any(|s| s.module == "rna"));
 
         write_report(&document, "report_out").expect("write report");

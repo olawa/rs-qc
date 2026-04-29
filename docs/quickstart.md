@@ -30,6 +30,19 @@ Useful options:
 - `--mapq` to set the filtering threshold used in summaries
 - `--threads` to control BGZF worker count
 
+## DNA
+
+Mosdepth-like coverage summaries over the genome, windows, and optional targets.
+
+```bash
+rs-qc dna -i sample.bam -o sample_dna --window-size 100000 --targets panel.bed
+```
+
+Useful options:
+
+- `--window-size` for genome windowing
+- `--targets` for BED-based target coverage
+
 ## RNA
 
 RNA-seq QC with gene body coverage, strandness, inner distance, read distribution, and contamination-aware summaries.
@@ -54,7 +67,7 @@ Useful options:
 Render a unified JSON and HTML report from existing module summaries.
 
 ```bash
-rs-qc report -i sample_fastq sample_align sample_rna -o sample_report
+rs-qc report -i sample_fastq sample_align sample_rna sample_dna -o sample_report
 ```
 
 Useful inputs:
@@ -67,7 +80,6 @@ Useful inputs:
 
 These are exposed in the CLI shell already, but are not implemented yet:
 
-- `rs-qc dna`
 - `rs-qc atac`
 - `rs-qc contam`
 
