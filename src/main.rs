@@ -183,7 +183,7 @@ pub enum IsoformSelectMode {
 #[command(
     author,
     version,
-    about = "Fast Rust QC for FASTQ, BAM/CRAM, and assay-specific NGS metrics"
+    about = "Rapid sequencing QC for FASTQ, BAM/CRAM, and assay-specific NGS metrics"
 )]
 struct Cli {
     #[command(subcommand)]
