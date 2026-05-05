@@ -1,3 +1,4 @@
+mod aggregate;
 mod config;
 mod report;
 mod scan;
@@ -14,7 +15,6 @@ use crate::io::annotation::{load_annotation, load_genes, AnnotationConfig, Annot
 use crate::io::bam::{alignment_start_0, for_each_aligned_block, match_span, reference_span};
 use crate::models::{normalize_chrom, Gene};
 use crate::stats::plotting::PlotMetadata;
-use crate::stats::{aggregate_genes, ThreePrimeParams};
 use anyhow::{bail, Result};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use noodles::bam;
@@ -688,22 +688,10 @@ pub fn run_rna(config: RnaQcConfig) -> Result<()> {
                 let index_ref = coverage_index_ref;
                 s.spawn(move |_| {
                     let agg_start = Instant::now();
-                    let three_prime_params = ThreePrimeParams {
-                        normalization_bp: config_ref.normalization_bp,
-                        max_3p_dist: config_ref.max_3p_dist,
-                        bin_size: config_ref.three_prime_bin_size,
-                        min_anchor_count: config_ref.three_prime_min_anchor_count,
-                        min_anchor_mean: config_ref.three_prime_min_anchor_mean,
-                        min_anchor_nonzero_bins: config_ref.three_prime_min_anchor_nonzero_bins,
-                        max_ratio: config_ref.three_prime_max_ratio,
-                    };
-
-                    let stats = aggregate_genes(
+                    let stats = aggregate::aggregate_sample(
                         index_ref,
-                        config_ref.min_support,
-                        &three_prime_params,
+                        config_ref,
                         state_ref.aligned_qc_reads,
-                        false,
                     );
                     println!("  - Coverage aggregation took: {:?}", agg_start.elapsed());
 
