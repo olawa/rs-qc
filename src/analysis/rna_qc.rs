@@ -1,4 +1,5 @@
 mod config;
+mod report;
 mod state;
 
 use crate::analysis::alignment_qc::sample_name_from_alignment_path;
@@ -11,14 +12,8 @@ use crate::analysis::types::AnalysisType;
 use crate::io::annotation::{load_annotation, load_genes, AnnotationConfig, AnnotationFormat};
 use crate::io::bam::{alignment_start_0, for_each_aligned_block, match_span, reference_span};
 use crate::models::{is_autosomal_chrom, normalize_chrom, Gene};
-use crate::stats::plotting::{
-    generate_gene_body_plot, generate_multi_3p_dist_plot, generate_multi_inner_distance_plot,
-    generate_multi_raw_3p_plot, PlotMetadata,
-};
-use crate::stats::{
-    aggregate_genes, write_3p_wide_tsv, write_classic_wide_format, write_feature_counts_tsv,
-    write_gene_profiles_tsv, ThreePrimeParams,
-};
+use crate::stats::plotting::PlotMetadata;
+use crate::stats::{aggregate_genes, ThreePrimeParams};
 use anyhow::{bail, Result};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use noodles::bam;
@@ -711,21 +706,7 @@ pub fn run_rna(config: RnaQcConfig) -> Result<()> {
                     );
                     println!("  - Coverage aggregation took: {:?}", agg_start.elapsed());
 
-                    if !config_ref.no_plot && config_ref.analysis.contains(&AnalysisType::GeneBody)
-                    {
-                        let _ = generate_gene_body_plot(
-                            &HashMap::from([(sample_ref.clone(), stats.percentile_means.clone())]),
-                            &HashMap::from([(
-                                sample_ref.clone(),
-                                PlotMetadata {
-                                    total_reads: stats.total_reads,
-                                    active_genes: stats.active_genes,
-                                    active_3p_genes: stats.active_3p_genes,
-                                },
-                            )]),
-                            &format!("{}.{}.geneBodyCoverage.svg", config_ref.output, sample_ref),
-                        );
-                    }
+                    let _ = report::write_sample_gene_body_plot(config_ref, sample_ref, &stats);
                     *stats_ptr.lock().unwrap() = Some(stats);
                 });
             }
@@ -785,6 +766,7 @@ pub fn run_rna(config: RnaQcConfig) -> Result<()> {
         // Update multi-sample maps safely outside the scope
         let stats_opt = stats_res.lock().unwrap().take();
         if let Some(stats) = stats_opt {
+            let _ = report::write_sample_reports(&config, &sample_name, &stats);
             classic_all.insert(sample_name.to_string(), stats.percentile_means.clone());
             classic_percent_all.insert(sample_name.to_string(), stats.percentile_normalized);
             dist_3p_all.insert(sample_name.to_string(), stats.dist_3p_means.clone());
@@ -802,19 +784,6 @@ pub fn run_rna(config: RnaQcConfig) -> Result<()> {
                     active_3p_genes: stats.active_3p_genes,
                 },
             );
-
-            // Write per-gene 3' QC and expression profiles
-            if config.analysis.contains(&AnalysisType::ThreePrime) {
-                let profiles_path = format!("{}.{}.gene_profiles.tsv", config.output, sample_name);
-                let _ = write_gene_profiles_tsv(&profiles_path, &stats.gene_qc);
-                println!("Gene profiles written to: {}", profiles_path);
-            }
-
-            if config.write_counts {
-                let counts_path = format!("{}.{}.gene_counts.tsv", config.output, sample_name);
-                let _ = write_feature_counts_tsv(&counts_path, &stats.gene_qc);
-                println!("Feature-count-like matrix written to: {}", counts_path);
-            }
         }
 
         if config.analysis.contains(&AnalysisType::Qc) {
@@ -834,94 +803,17 @@ pub fn run_rna(config: RnaQcConfig) -> Result<()> {
         coverage_index_ref.reset_coverage();
     }
 
-    if config.analysis.contains(&AnalysisType::GeneBody) && !classic_all.is_empty() {
-        let classic_path = format!("{}.geneBodyCoverage.txt", config.output);
-        write_classic_wide_format(&classic_path, &classic_all)?;
-        println!(
-            "\nMultiQC-compatible raw aggregate written to: {}",
-            classic_path
-        );
-
-        let classic_pct_path = format!("{}.geneBodyCoverage.percent.txt", config.output);
-        write_classic_wide_format(&classic_pct_path, &classic_percent_all)?;
-        println!(
-            "Normalized percentage aggregate written to: {}",
-            classic_pct_path
-        );
-
-        if !config.no_plot {
-            generate_gene_body_plot(
-                &classic_all,
-                &plot_metadata_all,
-                &format!("{}.geneBodyCoverage.svg", config.output),
-            )?;
-            println!(
-                "Gene body coverage plot written to: {}.geneBodyCoverage.svg",
-                config.output
-            );
-        }
-    }
-
-    if config.analysis.contains(&AnalysisType::ThreePrime) && !dist_3p_all.is_empty() {
-        let dist_3p_path = format!("{}.3p_anchor_normalized.tsv", config.output);
-        write_3p_wide_tsv(
-            &dist_3p_path,
-            &dist_3p_all,
-            config.three_prime_bin_size,
-            config.max_3p_dist,
-        )?;
-        println!("3' anchor-normalized profile written to: {}", dist_3p_path);
-
-        let dist_3p_raw_analyzed_path = format!("{}.3p_raw_analyzed.tsv", config.output);
-        write_3p_wide_tsv(
-            &dist_3p_raw_analyzed_path,
-            &dist_3p_raw_analyzed_all,
-            config.three_prime_bin_size,
-            config.max_3p_dist,
-        )?;
-        println!(
-            "3' raw analyzed profile written to: {}",
-            dist_3p_raw_analyzed_path
-        );
-
-        let dist_3p_raw_all_path = format!("{}.3p_raw_all.tsv", config.output);
-        write_3p_wide_tsv(
-            &dist_3p_raw_all_path,
-            &dist_3p_raw_all,
-            config.three_prime_bin_size,
-            config.max_3p_dist,
-        )?;
-        println!("3' raw all profile written to: {}", dist_3p_raw_all_path);
-
-        if !config.no_plot {
-            generate_multi_3p_dist_plot(
-                &dist_3p_all,
-                &plot_metadata_all,
-                &format!("{}.3p_dist.svg", config.output),
-                config.three_prime_bin_size,
-            )?;
-            generate_multi_raw_3p_plot(
-                &dist_3p_raw_analyzed_all,
-                &plot_metadata_all,
-                &format!("{}.3p_raw.svg", config.output),
-                config.three_prime_bin_size,
-            )?;
-        }
-    }
-
-    if config.analysis.contains(&AnalysisType::Qc) && !inner_distance_all.is_empty() {
-        if !config.no_plot {
-            generate_multi_inner_distance_plot(
-                &inner_distance_all,
-                &format!("{}.inner_distance.svg", config.output),
-                -200,
-            )?;
-            println!(
-                "Inner distance profile written to: {}.inner_distance.svg",
-                config.output
-            );
-        }
-    }
+    report::write_multi_sample_outputs(
+        &config,
+        &classic_all,
+        &classic_percent_all,
+        &dist_3p_all,
+        &dist_3p_support_all,
+        &dist_3p_raw_all,
+        &dist_3p_raw_analyzed_all,
+        &inner_distance_all,
+        &plot_metadata_all,
+    )?;
 
     println!("\\nAll tasks completed in {:.2?}.", start_time.elapsed());
     Ok(())
