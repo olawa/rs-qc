@@ -23,6 +23,7 @@ pub struct AggregatedStats {
     pub percentile_means: Vec<f64>,
     pub percentile_normalized: Vec<f64>,
     pub percentile_support: Vec<usize>,
+    pub stratified_percentile_normalized: HashMap<String, Vec<f64>>,
     pub bin_size: usize,
     pub active_genes: usize,
     pub active_3p_genes: usize,
@@ -66,8 +67,10 @@ pub fn aggregate_genes(
     total_reads: u64,
     _is_ends_mode: bool,
 ) -> AggregatedStats {
-    let n_3p_bins = (three_prime_params.max_3p_dist + three_prime_params.bin_size - 1) / three_prime_params.bin_size;
-    let norm_bins = (three_prime_params.normalization_bp + three_prime_params.bin_size - 1) / three_prime_params.bin_size;
+    let n_3p_bins = (three_prime_params.max_3p_dist + three_prime_params.bin_size - 1)
+        / three_prime_params.bin_size;
+    let norm_bins = (three_prime_params.normalization_bp + three_prime_params.bin_size - 1)
+        / three_prime_params.bin_size;
 
     let (
         dist_3p_sums,
@@ -113,7 +116,7 @@ pub fn aggregate_genes(
                     .iter()
                     .map(|a| a.load(Ordering::Relaxed))
                     .sum();
-                
+
                 if total_pct_count >= min_support as u32 {
                     active += 1;
                     let mean_pct = (total_pct_count as f64 / 100.0).max(0.001);
@@ -139,7 +142,7 @@ pub fn aggregate_genes(
                 }
 
                 let anchor_mean = anchor_sum as f64 / anchor_bins as f64;
-                
+
                 let mut used = true;
                 let mut skip_reason = None;
 
@@ -170,7 +173,7 @@ pub fn aggregate_genes(
                         let count = gene.counts_3p[i].load(Ordering::Relaxed);
                         let ratio = count as f64 / anchor_mean;
                         max_ratio_found = max_ratio_found.max(ratio);
-                        
+
                         let clipped_ratio = ratio.min(three_prime_params.max_ratio);
                         d3p_s[i] += clipped_ratio;
                         d3p_sup[i] += 1;
@@ -200,11 +203,21 @@ pub fn aggregate_genes(
                     max_ratio: max_ratio_found,
                     used,
                     skip_reason,
-                    counts_3p: gene.counts_3p.iter().map(|a| a.load(Ordering::Relaxed)).collect(),
-                    counts_percentile: gene.counts_percentile.iter().map(|a| a.load(Ordering::Relaxed)).collect(),
+                    counts_3p: gene
+                        .counts_3p
+                        .iter()
+                        .map(|a| a.load(Ordering::Relaxed))
+                        .collect(),
+                    counts_percentile: gene
+                        .counts_percentile
+                        .iter()
+                        .map(|a| a.load(Ordering::Relaxed))
+                        .collect(),
                 });
 
-                (d3p_s, d3p_sup, d3p_raw, p_s, p_sup, active, active_3p, d3p_raw_a, qc_list)
+                (
+                    d3p_s, d3p_sup, d3p_raw, p_s, p_sup, active, active_3p, d3p_raw_a, qc_list,
+                )
             },
         )
         .reduce(
@@ -274,6 +287,7 @@ pub fn aggregate_genes(
         percentile_means,
         percentile_normalized,
         percentile_support,
+        stratified_percentile_normalized: HashMap::new(),
         bin_size: three_prime_params.bin_size,
         active_genes,
         active_3p_genes,
@@ -555,10 +569,7 @@ pub fn write_classic_wide_format(
     Ok(())
 }
 
-pub fn write_gene_profiles_tsv(
-    path: &str,
-    qc_data: &[ThreePrimeGeneQc],
-) -> anyhow::Result<()> {
+pub fn write_gene_profiles_tsv(path: &str, qc_data: &[ThreePrimeGeneQc]) -> anyhow::Result<()> {
     let mut file = File::create(path)?;
     writeln!(
         file,
@@ -566,9 +577,19 @@ pub fn write_gene_profiles_tsv(
     )?;
 
     for q in qc_data {
-        let counts_3p_csv = q.counts_3p.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(",");
-        let counts_pct_csv = q.counts_percentile.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(",");
-        
+        let counts_3p_csv = q
+            .counts_3p
+            .iter()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let counts_pct_csv = q
+            .counts_percentile
+            .iter()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+
         let mean_body = q.total_pct_count as f64 / 100.0;
 
         writeln!(
@@ -594,12 +615,12 @@ pub fn write_gene_profiles_tsv(
     Ok(())
 }
 
-pub fn write_feature_counts_tsv(
-    path: &str,
-    qc_data: &[ThreePrimeGeneQc],
-) -> anyhow::Result<()> {
+pub fn write_feature_counts_tsv(path: &str, qc_data: &[ThreePrimeGeneQc]) -> anyhow::Result<()> {
     let mut file = File::create(path)?;
-    writeln!(file, "gene_id\tgene_name\tchrom\tstrand\tlength\tgene_body_coverage_count\tanchor_3p_count")?;
+    writeln!(
+        file,
+        "gene_id\tgene_name\tchrom\tstrand\tlength\tgene_body_coverage_count\tanchor_3p_count"
+    )?;
 
     for q in qc_data {
         writeln!(
@@ -663,30 +684,69 @@ mod tests {
             max_ratio: 3.0,
         };
 
-        // 1. Accepted Gene: anchor bins 0, 1 (200bp total). 
+        // 1. Accepted Gene: anchor bins 0, 1 (200bp total).
         // Counts: bin0=100, bin1=100. Anchor mean = 100.
-        let tx1 = Transcript::new("tx1".into(), "chr1".into(), '+', None, vec![Exon { start: 1, end: 1001 }], None, None);
+        let tx1 = Transcript::new(
+            "tx1".into(),
+            "chr1".into(),
+            '+',
+            None,
+            vec![Exon {
+                start: 1,
+                end: 1001,
+            }],
+            None,
+            None,
+        );
         let gene1 = Gene::new("g1".into(), None, tx1, 1000, 100);
         gene1.counts_3p[0].store(100, Ordering::Relaxed);
         gene1.counts_3p[1].store(100, Ordering::Relaxed);
         gene1.counts_3p[2].store(50, Ordering::Relaxed);
-        for i in 0..100 { gene1.counts_percentile[i].store(100, Ordering::Relaxed); }
+        for i in 0..100 {
+            gene1.counts_percentile[i].store(100, Ordering::Relaxed);
+        }
 
         // 2. Low Anchor Gene: bin0=1, bin1=1 (anchor sum=2 < 50). Should be skipped.
-        let tx2 = Transcript::new("tx2".into(), "chr1".into(), '+', None, vec![Exon { start: 1, end: 1001 }], None, None);
+        let tx2 = Transcript::new(
+            "tx2".into(),
+            "chr1".into(),
+            '+',
+            None,
+            vec![Exon {
+                start: 1,
+                end: 1001,
+            }],
+            None,
+            None,
+        );
         let gene2 = Gene::new("g2".into(), None, tx2, 1000, 100);
         gene2.counts_3p[0].store(1, Ordering::Relaxed);
         gene2.counts_3p[1].store(1, Ordering::Relaxed);
         gene2.counts_3p[2].store(1000, Ordering::Relaxed); // Huge spike downstream
-        for i in 0..100 { gene2.counts_percentile[i].store(100, Ordering::Relaxed); }
+        for i in 0..100 {
+            gene2.counts_percentile[i].store(100, Ordering::Relaxed);
+        }
 
         // 3. High Ratio Gene: anchor sum=200, mean=100. bin2=500 -> ratio 5.0. Should be clipped to 3.0.
-        let tx3 = Transcript::new("tx3".into(), "chr1".into(), '+', None, vec![Exon { start: 1, end: 1001 }], None, None);
+        let tx3 = Transcript::new(
+            "tx3".into(),
+            "chr1".into(),
+            '+',
+            None,
+            vec![Exon {
+                start: 1,
+                end: 1001,
+            }],
+            None,
+            None,
+        );
         let gene3 = Gene::new("g3".into(), None, tx3, 1000, 100);
         gene3.counts_3p[0].store(100, Ordering::Relaxed);
         gene3.counts_3p[1].store(100, Ordering::Relaxed);
         gene3.counts_3p[2].store(500, Ordering::Relaxed); // Ratio 5.0
-        for i in 0..100 { gene3.counts_percentile[i].store(100, Ordering::Relaxed); }
+        for i in 0..100 {
+            gene3.counts_percentile[i].store(100, Ordering::Relaxed);
+        }
 
         let index = AnnotationIndex {
             version: 1,
@@ -700,18 +760,22 @@ mod tests {
 
         // Gene 1 and 3 are kept. Gene 2 is skipped.
         assert_eq!(stats.active_3p_genes, 2);
-        
+
         // Gene 1: bin0=1.0, bin1=1.0, bin2=0.5
         // Gene 3: bin0=1.0, bin1=1.0, bin2=3.0 (clipped from 5.0)
         // Average: bin0=1.0, bin1=1.0, bin2=(0.5 + 3.0)/2 = 1.75
-        
+
         assert!((stats.dist_3p_means[0] - 1.0).abs() < 0.001);
         assert!((stats.dist_3p_means[1] - 1.0).abs() < 0.001);
         assert!((stats.dist_3p_means[2] - 1.75).abs() < 0.001);
-        
+
         // Check QC data
         let g2_qc = stats.gene_qc.iter().find(|q| q.gene_id == "g2").unwrap();
         assert!(!g2_qc.used);
-        assert!(g2_qc.skip_reason.as_ref().unwrap().contains("low anchor sum"));
+        assert!(g2_qc
+            .skip_reason
+            .as_ref()
+            .unwrap()
+            .contains("low anchor sum"));
     }
 }

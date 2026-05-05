@@ -190,6 +190,8 @@ struct FastqArgs {
     input: Vec<String>,
     #[arg(short, long)]
     output: Option<String>,
+    #[arg(short, long, default_value_t = num_cpus::get().max(1))]
+    threads: usize,
     #[arg(long, default_value_t = 1_000_000)]
     sample_size: usize,
     #[arg(long, default_value_t = 7)]
@@ -204,6 +206,12 @@ struct FastqArgs {
     paired: bool,
     #[arg(long, default_value_t = 1000)]
     length_bin_size: usize,
+    #[arg(long, default_value_t = false)]
+    pigz: bool,
+    #[arg(long, default_value_t = 2)]
+    pigz_threads: usize,
+    #[arg(long, default_value_t = 50_000)]
+    batch_size: usize,
 }
 
 #[derive(ClapArgs, Debug)]
@@ -440,6 +448,7 @@ fn run_fastq(args: FastqArgs) -> Result<()> {
     let config = FastqQcConfig {
         inputs: args.input,
         output_prefix: output_prefix.clone(),
+        threads: args.threads.max(1),
         sample_size: args.sample_size,
         kmer_size: args.kmer_size,
         top_n: args.top_n,
@@ -447,6 +456,9 @@ fn run_fastq(args: FastqArgs) -> Result<()> {
         no_kmers: args.no_kmers,
         paired: args.paired,
         length_bin_size: args.length_bin_size,
+        use_pigz: args.pigz,
+        pigz_threads: args.pigz_threads.max(1),
+        batch_size: args.batch_size.max(1),
     };
 
     let metrics = run_fastq_qc(&config)?;

@@ -21,11 +21,7 @@ pub(crate) struct RnaWorkerState {
 }
 
 impl RnaWorkerState {
-    pub(crate) fn new_with_capacity(
-        _n_genes: usize,
-        _max_3p_dist: usize,
-        qc_sample_size: usize,
-    ) -> Self {
+    pub(crate) fn new(qc_sample_size: usize) -> Self {
         Self {
             records_seen: 0,
             fail_unmapped: 0,

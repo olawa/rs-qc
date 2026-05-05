@@ -172,8 +172,14 @@ impl RnaSeqQcSummary {
                 .map(|v| format!("{:.4}", v))
                 .unwrap_or_else(|| "NA".to_string())
         ));
-        out.push_str(&format!("stranded_forward_count\t{}\n", self.stranded_forward_count));
-        out.push_str(&format!("stranded_reverse_count\t{}\n", self.stranded_reverse_count));
+        out.push_str(&format!(
+            "stranded_forward_count\t{}\n",
+            self.stranded_forward_count
+        ));
+        out.push_str(&format!(
+            "stranded_reverse_count\t{}\n",
+            self.stranded_reverse_count
+        ));
         out
     }
 
@@ -286,18 +292,22 @@ impl InlineQcState {
         };
 
         // Aligned length excluding introns (N)
-        let aligned_len = record.cigar().iter().map(|result| {
-            let op = result.expect("Invalid CIGAR op");
-            use noodles::sam::alignment::record::cigar::op::Kind;
-            match op.kind() {
-                Kind::Match |
-                Kind::Deletion |
-                Kind::Insertion |
-                Kind::SequenceMatch |
-                Kind::SequenceMismatch => op.len() as u64,
-                _ => 0
-            }
-        }).sum();
+        let aligned_len = record
+            .cigar()
+            .iter()
+            .map(|result| {
+                let op = result.expect("Invalid CIGAR op");
+                use noodles::sam::alignment::record::cigar::op::Kind;
+                match op.kind() {
+                    Kind::Match
+                    | Kind::Deletion
+                    | Kind::Insertion
+                    | Kind::SequenceMatch
+                    | Kind::SequenceMismatch => op.len() as u64,
+                    _ => 0,
+                }
+            })
+            .sum();
 
         // Determine if this read end overlaps a gene on a specific strand
         let mut gene_strand = None;
@@ -311,7 +321,10 @@ impl InlineQcState {
             }
             Hits::Multi(indices) => {
                 // If all genes have the same strand, we can use it
-                let strands: Vec<char> = indices.iter().map(|&idx| _genes[idx as usize].representative.strand).collect();
+                let strands: Vec<char> = indices
+                    .iter()
+                    .map(|&idx| _genes[idx as usize].representative.strand)
+                    .collect();
                 if strands.iter().all(|&s| s == strands[0]) {
                     gene_strand = Some(strands[0]);
                     // If multiple genes, just pick the first for index
@@ -340,11 +353,15 @@ impl InlineQcState {
                         let gene = &_genes[g1];
                         let p1 = r1.first_match.min(r2.first_match);
                         let p2 = r1.last_match.max(r2.last_match).saturating_sub(1);
-                        
-                        if let (Some(s1), Some(s2)) = (gene.bin_map.get_spliced_5p(p1), gene.bin_map.get_spliced_5p(p2)) {
+
+                        if let (Some(s1), Some(s2)) = (
+                            gene.bin_map.get_spliced_5p(p1),
+                            gene.bin_map.get_spliced_5p(p2),
+                        ) {
                             let spliced_frag_len = (s1 as i64 - s2 as i64).abs() + 1;
-                            let inner = spliced_frag_len - (r1.aligned_len as i64 + r2.aligned_len as i64);
-                            
+                            let inner =
+                                spliced_frag_len - (r1.aligned_len as i64 + r2.aligned_len as i64);
+
                             // Filter for reasonable inner distance (-1000 to 2000 bp)
                             if inner >= -1000 && inner <= 2000 {
                                 self.record_pair(inner, &r1, &r2);

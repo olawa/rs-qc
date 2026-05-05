@@ -5,33 +5,24 @@ mod scan;
 mod state;
 
 use crate::analysis::alignment_qc::sample_name_from_alignment_path;
-use crate::analysis::bam_scan::{find_bai_path, generate_windows};
 use crate::analysis::contamination::ContaminantIndex;
 use crate::analysis::feature_index::FeatureIndex;
 use crate::analysis::index::{AnnotationIndex, DenseMap};
 use crate::analysis::qc::{InlineQcState, ReadEndType};
 use crate::analysis::types::AnalysisType;
 use crate::io::annotation::{load_annotation, load_genes, AnnotationConfig, AnnotationFormat};
-use crate::io::bam::{alignment_start_0, for_each_aligned_block, match_span, reference_span};
+use crate::io::bam::alignment_start_0;
 use crate::models::{normalize_chrom, Gene};
 use crate::stats::plotting::PlotMetadata;
 use anyhow::{bail, Result};
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use noodles::bam;
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Instant;
 
-thread_local! {
-    static BAM_READER: RefCell<Option<(String, bam::io::IndexedReader<noodles::bgzf::Reader<File>>)>> = RefCell::new(None);
-}
-
-const MAX_REASONABLE_INNER_DISTANCE_BP: i64 = 2_000;
 pub use config::RnaQcConfig;
-use state::RnaWorkerState;
 
 pub fn run_rna(config: RnaQcConfig) -> Result<()> {
     let threads = normalize_thread_count(config.threads);
@@ -190,459 +181,18 @@ pub fn run_rna(config: RnaQcConfig) -> Result<()> {
 
         let dense_maps = Arc::new(dense_maps);
 
-        let mb_index_path = find_bai_path(bam_path);
         let finalize_start = Instant::now();
-        let mut total_state = if let Some(bai_path) = mb_index_path {
-            println!("  - BAI Index found. Using high-performance parallel dense scan.");
-            let bai = bam::bai::read(&bai_path)?;
-            let windows = generate_windows(&header, 10_000_000);
-
-            let m_pb = MultiProgress::new();
-            let pb = m_pb.add(ProgressBar::new(windows.len() as u64));
-            pb.set_style(ProgressStyle::default_bar().template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} Windows ({eta})")?);
-
-            let bai_arc = Arc::new(bai);
-            let n_genes = coverage_index_ref.genes.len();
-            let max_3p_dist = config.max_3p_dist;
-            let qc_sample_size = config.qc_sample_size.div_ceil(threads);
-            let total_state = windows
-                .par_iter()
-                .fold(
-                    move || RnaWorkerState::new_with_capacity(n_genes, max_3p_dist, qc_sample_size),
-                    |mut state, window| {
-                    BAM_READER.with(|cell| {
-                        let mut opt = cell.borrow_mut();
-                        let needs_reader = opt
-                            .as_ref()
-                            .map(|(path, _)| path != bam_path)
-                            .unwrap_or(true);
-                        if needs_reader {
-                            let f = File::open(bam_path).expect("Failed to open BAM");
-                            let mut r = bam::io::indexed_reader::Builder::default()
-                                .set_index(bai_arc.as_ref().clone())
-                                .build_from_reader(f)
-                                .expect("Failed to build indexed reader");
-                            let _ = r.read_header().expect("Failed to read BAM header");
-                            *opt = Some((bam_path.clone(), r));
-                        }
-
-                        let reader = &mut opt.as_mut().unwrap().1;
-                        let chrom = &window.chrom;
-                        let chrom_norm = &window.chrom_norm;
-                        let maybe_dense = dense_maps.get(chrom_norm);
-                        let maybe_feature = feature_index
-                            .as_ref()
-                            .and_then(|index| index.chroms.get(chrom_norm));
-                        let is_mtdna_window = is_mtdna_chrom_norm(chrom_norm);
-                        let is_rdna_contig_window = is_rdna_chrom_norm(chrom_norm, rdna_contigs.as_ref());
-                        let maybe_rdna_intervals = rdna_intervals
-                            .as_ref()
-                            .and_then(|index| index.chroms.get(chrom_norm));
-
-                        let region: noodles::core::Region =
-                            match format!("{}:{}-{}", chrom, window.start + 1, window.end).parse() {
-                                Ok(r) => r,
-                                Err(_) => return,
-                            };
-
-                        let win_start = window.start as u64;
-                        let win_end = window.end as u64;
-                        let mut feature_cursor = maybe_feature.map(|chrom_index| chrom_index.cursor_at(win_start));
-                        let mut rdna_cursor = maybe_rdna_intervals
-                            .map(|chrom_index| chrom_index.cursor_at(win_start));
-
-                        match reader.query(&header, &region) {
-                            Ok(query) => {
-                                for result in query {
-                                    match result {
-                                        Ok(record) => {
-                                            let Some(pos) = alignment_start_0(&record) else {
-                                                continue;
-                                            };
-                                            let owns_start = window_owns_record_start(pos, win_start, win_end);
-
-                                            if owns_start {
-                                                state.records_seen += 1;
-                                            }
-                                            let flags = record.flags();
-
-                                            if flags.is_unmapped() {
-                                                if owns_start {
-                                                    state.fail_unmapped += 1;
-                                                }
-                                                continue;
-                                            }
-                                            if flags.is_secondary() || flags.is_supplementary() {
-                                                if owns_start {
-                                                    state.fail_secondary += 1;
-                                                }
-                                                continue;
-                                            }
-                                            if flags.is_qc_fail() || flags.is_duplicate() {
-                                                if owns_start {
-                                                    state.fail_qc += 1;
-                                                }
-                                                continue;
-                                            }
-                                            let record_mapq = record
-                                                .mapping_quality()
-                                                .map(|m| m.get())
-                                                .unwrap_or(255);
-                                            if record_mapq < config.mapq {
-                                                if owns_start {
-                                                    state.fail_mapq += 1;
-                                                }
-                                                continue;
-                                            }
-
-                                            if config.r2_only && !flags.is_last_segment() {
-                                                continue;
-                                            }
-
-                                            let genes_ref = &coverage_index_ref.genes;
-                                            let read_match_span = match_span(&record);
-
-                                            if owns_start {
-                                                state.aligned_qc_reads += 1;
-                                                if is_mtdna_window {
-                                                    state.mtdna_reads += 1;
-                                                }
-
-                                                let mut is_rdna = is_rdna_contig_window;
-                                                if !is_rdna {
-                                                    if let Some(chrom_index) = maybe_rdna_intervals {
-                                                        if let Some(cursor) = rdna_cursor.as_mut() {
-                                                            if let Some((first_match, last_match)) = read_match_span {
-                                                                let mid = first_match
-                                                                    + (last_match - first_match) / 2;
-                                                                is_rdna = chrom_index.contains(mid, cursor);
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                if is_rdna {
-                                                    state.rdna_reads += 1;
-                                                }
-                                            }
-
-                                            if let Some(chrom_index) = maybe_feature {
-                                                if let Some((first_match, last_match)) = read_match_span {
-                                                    let mid = first_match + (last_match - first_match) / 2;
-                                                    if mid >= win_start && mid < win_end {
-                                                        state.total_tags += 1;
-                                                        if let Some(cursor) = feature_cursor.as_mut() {
-                                                            let region = chrom_index.classify(mid, cursor);
-                                                            state.read_dist_counts[region as usize] += 1;
-                                                        }
-                                                    }
-                                                }
-                                            }
-
-                                            if let Some(dense) = maybe_dense {
-                                                let needs_coverage =
-                                                    config.analysis.contains(&AnalysisType::GeneBody)
-                                                        || config
-                                                            .analysis
-                                                            .contains(&AnalysisType::ThreePrime);
-
-                                                if needs_coverage {
-                                                    let process_pos = |p: u64, state: &mut RnaWorkerState| {
-                                                        use crate::analysis::index::Hits;
-                                                        match dense.get_hits(p) {
-                                                            Hits::None => {}
-                                                            Hits::Single(g_idx) => {
-                                                                let g_idx = g_idx as usize;
-                                                                state.overlaps_found += 1;
-                                                                let gene = &genes_ref[g_idx];
-                                                                if let Some(s_5p) = gene.bin_map.get_spliced_5p(p) {
-                                                                    let pct_idx = (s_5p as usize * 100) / (gene.total_len as usize).max(1);
-                                                                    gene.add_percentile(pct_idx, 1);
-
-                                                                    let dist_3p = (gene.total_len as usize).saturating_sub(s_5p as usize + 1);
-                                                                    let bin = dist_3p / config.three_prime_bin_size;
-                                                                    gene.add_3p(bin, 1);
-                                                                }
-                                                            }
-                                                            Hits::Multi(indices) => {
-                                                                for &g_idx in indices {
-                                                                    let g_idx = g_idx as usize;
-                                                                    state.overlaps_found += 1;
-                                                                        let gene = &genes_ref[g_idx];
-                                                                    if let Some(s_5p) = gene.bin_map.get_spliced_5p(p) {
-                                                                        let pct_idx = (s_5p as usize * 100) / (gene.total_len as usize).max(1);
-                                                                        gene.add_percentile(pct_idx, 1);
-
-                                                                        let dist_3p = (gene.total_len as usize).saturating_sub(s_5p as usize + 1);
-                                                                        let bin = dist_3p / config.three_prime_bin_size;
-                                                                        gene.add_3p(bin, 1);
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                    };
-
-                                                if config.ends {
-                                                    let is_reverse = flags.is_reverse_complemented();
-                                                    let target_pos = if is_reverse {
-                                                        reference_span(&record)
-                                                            .map(|(_, end)| end.saturating_sub(1))
-                                                            .unwrap_or(pos)
-                                                    } else {
-                                                        pos
-                                                    };
-                                                    process_pos(target_pos, &mut state);
-                                                } else {
-                                                    for_each_aligned_block(&record, |block_start, block_end| {
-                                                        if block_start >= win_end {
-                                                            return;
-                                                        }
-                                                        let p_lo = block_start.max(win_start);
-                                                        let p_hi = block_end.min(win_end);
-                                                        if p_lo >= p_hi {
-                                                            return;
-                                                        }
-
-                                                        if config.step_size > 1 {
-                                                            let step = config.step_size as u64;
-                                                            let first_sample = if p_lo % step == 0 {
-                                                                p_lo
-                                                            } else {
-                                                                p_lo + (step - (p_lo % step))
-                                                            };
-                                                            for p in (first_sample..p_hi).step_by(config.step_size) {
-                                                                process_pos(p, &mut state);
-                                                            }
-                                                        } else {
-                                                            for p in p_lo..p_hi {
-                                                                process_pos(p, &mut state);
-                                                            }
-                                                        }
-                                                    });
-                                                }
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                            eprintln!(
-                                                "    [ERROR] Query record error in {}:{}-{}: {:?}",
-                                                chrom, window.start, window.end, e
-                                            );
-                                            return;
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                println!(
-                                    "    [ERROR] Query failed for region {}:{}-{}: {}",
-                                    chrom,
-                                    window.start + 1,
-                                    window.end,
-                                    e
-                                );
-                            }
-                        }
-                    });
-                    pb.inc(1);
-                    state
-                })
-                .reduce(
-                    move || RnaWorkerState::new_with_capacity(n_genes, max_3p_dist, qc_sample_size),
-                    RnaWorkerState::merge,
-                );
-            total_state
-        } else {
-            println!("  - No BAI Index found. Falling back to sequential single-threaded scan.");
-            let file = File::open(bam_path)?;
-            let mut reader = bam::io::Reader::new(file);
-            let n_genes = coverage_index_ref.genes.len();
-            let mut state = RnaWorkerState::new_with_capacity(
-                n_genes,
-                config.max_3p_dist,
-                config.qc_sample_size,
-            );
-
-            let ref_metadata: Vec<_> = header
-                .reference_sequences()
-                .iter()
-                .map(|(name, _)| {
-                    let chrom = String::from_utf8_lossy(name.as_ref()).to_string();
-                    let chrom_norm = normalize_chrom(&chrom).into_owned();
-                    let maybe_dense = dense_maps.get(&chrom_norm);
-                    let maybe_feature = feature_index
-                        .as_ref()
-                        .and_then(|idx| idx.chroms.get(&chrom_norm));
-                    let is_mtdna = is_mtdna_chrom_norm(&chrom_norm);
-                    let is_rdna_contig = is_rdna_chrom_norm(&chrom_norm, rdna_contigs.as_ref());
-                    let maybe_rdna_intervals = rdna_intervals
-                        .as_ref()
-                        .and_then(|idx| idx.chroms.get(&chrom_norm));
-                    (
-                        chrom,
-                        chrom_norm,
-                        maybe_dense,
-                        maybe_feature,
-                        is_mtdna,
-                        is_rdna_contig,
-                        maybe_rdna_intervals,
-                    )
-                })
-                .collect();
-
-            let pb = ProgressBar::new_spinner();
-            pb.set_style(
-                ProgressStyle::default_spinner()
-                    .template("{spinner:.green} [{elapsed_precise}] {pos} records scanned")?,
-            );
-
-            for result in reader.records() {
-                let record = result?;
-                pb.inc(1);
-                state.records_seen += 1;
-
-                let flags = record.flags();
-                if flags.is_unmapped() {
-                    state.fail_unmapped += 1;
-                    continue;
-                }
-                if flags.is_secondary() || flags.is_supplementary() {
-                    state.fail_secondary += 1;
-                    continue;
-                }
-                if flags.is_qc_fail() || flags.is_duplicate() {
-                    state.fail_qc += 1;
-                    continue;
-                }
-
-                let record_mapq = record.mapping_quality().map(|m| m.get()).unwrap_or(255);
-                if record_mapq < config.mapq {
-                    state.fail_mapq += 1;
-                    continue;
-                }
-                if config.r2_only && !flags.is_last_segment() {
-                    continue;
-                }
-
-                let id = match record.reference_sequence_id() {
-                    Some(Ok(id)) => usize::from(id),
-                    _ => continue,
-                };
-                let (
-                    _chrom,
-                    _chrom_norm,
-                    maybe_dense,
-                    maybe_feature,
-                    is_mtdna,
-                    is_rdna_contig,
-                    maybe_rdna_intervals,
-                ) = &ref_metadata[id];
-
-                let Some(pos) = alignment_start_0(&record) else {
-                    continue;
-                };
-
-                let read_match_span = match_span(&record);
-                state.aligned_qc_reads += 1;
-                if *is_mtdna {
-                    state.mtdna_reads += 1;
-                }
-
-                let mut is_rdna = *is_rdna_contig;
-                if !is_rdna {
-                    if let Some(chrom_index) = maybe_rdna_intervals {
-                        if let Some((first_match, last_match)) = read_match_span {
-                            let mid = first_match + (last_match - first_match) / 2;
-                            let mut cursor = chrom_index.cursor_at(first_match);
-                            is_rdna = chrom_index.contains(mid, &mut cursor);
-                        }
-                    }
-                }
-                if is_rdna {
-                    state.rdna_reads += 1;
-                }
-
-                if let Some(chrom_index) = maybe_feature {
-                    if let Some((first_match, last_match)) = read_match_span {
-                        let mid = first_match + (last_match - first_match) / 2;
-                        let mut cursor = chrom_index.cursor_at(mid);
-                        let region = chrom_index.classify(mid, &mut cursor);
-                        state.read_dist_counts[region as usize] += 1;
-                        state.total_tags += 1;
-                    }
-                }
-
-                if let Some(dense) = maybe_dense {
-                    if config.analysis.contains(&AnalysisType::GeneBody)
-                        || config.analysis.contains(&AnalysisType::ThreePrime)
-                    {
-                        let process_pos = |p: u64, state: &mut RnaWorkerState| {
-                            use crate::analysis::index::Hits;
-                            match dense.get_hits(p) {
-                                Hits::None => {}
-                                Hits::Single(g_idx) => {
-                                    let g_idx = g_idx as usize;
-                                    state.overlaps_found += 1;
-                                    let gene = &coverage_index_ref.genes[g_idx];
-                                    if let Some(s_5p) = gene.bin_map.get_spliced_5p(p) {
-                                        let pct_idx = (s_5p as usize * 100)
-                                            / (gene.total_len as usize).max(1);
-                                        gene.add_percentile(pct_idx, 1);
-
-                                        let dist_3p = (gene.total_len as usize)
-                                            .saturating_sub(s_5p as usize + 1);
-                                        let bin = dist_3p / config.three_prime_bin_size;
-                                        gene.add_3p(bin, 1);
-                                    }
-                                }
-                                Hits::Multi(indices) => {
-                                    for &g_idx in indices {
-                                        let g_idx = g_idx as usize;
-                                        state.overlaps_found += 1;
-                                        let gene = &coverage_index_ref.genes[g_idx];
-                                        if let Some(s_5p) = gene.bin_map.get_spliced_5p(p) {
-                                            let pct_idx = (s_5p as usize * 100)
-                                                / (gene.total_len as usize).max(1);
-                                            gene.add_percentile(pct_idx, 1);
-
-                                            let dist_3p = (gene.total_len as usize)
-                                                .saturating_sub(s_5p as usize + 1);
-                                            let bin = dist_3p / config.three_prime_bin_size;
-                                            gene.add_3p(bin, 1);
-                                        }
-                                    }
-                                }
-                            }
-                        };
-
-                        if config.ends {
-                            let is_reverse = flags.is_reverse_complemented();
-                            let target_pos = if is_reverse {
-                                reference_span(&record)
-                                    .map(|(_, end)| end.saturating_sub(1))
-                                    .unwrap_or(pos)
-                            } else {
-                                pos
-                            };
-                            process_pos(target_pos, &mut state);
-                        } else {
-                            for_each_aligned_block(&record, |block_start, block_end| {
-                                if config.step_size > 1 {
-                                    for p in (block_start..block_end).step_by(config.step_size) {
-                                        process_pos(p, &mut state);
-                                    }
-                                } else {
-                                    for p in block_start..block_end {
-                                        process_pos(p, &mut state);
-                                    }
-                                }
-                            });
-                        }
-                    }
-                }
-            }
-            pb.finish_and_clear();
-            state
-        };
+        let mut total_state = scan::scan_bam_coverage(&scan::ScanContext {
+            bam_path,
+            header: &header,
+            dense_maps: dense_maps.as_ref(),
+            coverage_index: coverage_index_ref,
+            feature_index: feature_index.as_deref(),
+            rdna_contigs: rdna_contigs.as_ref(),
+            rdna_intervals: rdna_intervals.as_deref(),
+            config: &config,
+            threads,
+        })?;
 
         if config.analysis.contains(&AnalysisType::Qc) {
             let qc_start = Instant::now();
@@ -681,7 +231,7 @@ pub fn run_rna(config: RnaQcConfig) -> Result<()> {
                 || config.analysis.contains(&AnalysisType::ThreePrime)
             {
                 let stats_ptr = Arc::clone(&stats_res);
-                let _errors = Arc::clone(&report_errors);
+                let errors = Arc::clone(&report_errors);
                 let config_ref = &config;
                 let sample_ref = &sample_name;
                 let state_ref = &total_state;
@@ -695,7 +245,13 @@ pub fn run_rna(config: RnaQcConfig) -> Result<()> {
                     );
                     println!("  - Coverage aggregation took: {:?}", agg_start.elapsed());
 
-                    let _ = report::write_sample_gene_body_plot(config_ref, sample_ref, &stats);
+                    if let Err(e) =
+                        report::write_sample_gene_body_plot(config_ref, sample_ref, &stats)
+                    {
+                        errors.lock().unwrap().push(format!(
+                            "failed to write gene body plot for {sample_ref}: {e}"
+                        ));
+                    }
                     *stats_ptr.lock().unwrap() = Some(stats);
                 });
             }
@@ -755,7 +311,7 @@ pub fn run_rna(config: RnaQcConfig) -> Result<()> {
         // Update multi-sample maps safely outside the scope
         let stats_opt = stats_res.lock().unwrap().take();
         if let Some(stats) = stats_opt {
-            let _ = report::write_sample_reports(&config, &sample_name, &stats);
+            report::write_sample_reports(&config, &sample_name, &stats)?;
             classic_all.insert(sample_name.to_string(), stats.percentile_means.clone());
             classic_percent_all.insert(sample_name.to_string(), stats.percentile_normalized);
             dist_3p_all.insert(sample_name.to_string(), stats.dist_3p_means.clone());
@@ -820,16 +376,9 @@ fn normalize_thread_count(threads: usize) -> usize {
     scan::normalize_thread_count(threads)
 }
 
+#[cfg(test)]
 fn window_owns_record_start(pos: u64, win_start: u64, win_end: u64) -> bool {
     scan::window_owns_record_start(pos, win_start, win_end)
-}
-
-fn is_mtdna_chrom_norm(chrom: &str) -> bool {
-    scan::is_mtdna_chrom_norm(chrom)
-}
-
-fn is_rdna_chrom_norm(chrom: &str, rdna_contigs: &HashSet<String>) -> bool {
-    scan::is_rdna_chrom_norm(chrom, rdna_contigs)
 }
 
 fn scan_inline_qc_sample(

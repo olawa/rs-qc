@@ -1,7 +1,7 @@
 use super::config::RnaQcConfig;
 use crate::stats::plotting::{
     generate_gene_body_plot, generate_multi_3p_dist_plot, generate_multi_inner_distance_plot,
-    generate_multi_raw_3p_plot, PlotMetadata,
+    generate_multi_raw_3p_plot, generate_stratified_gene_body_plot, PlotMetadata,
 };
 use crate::stats::{
     write_3p_wide_tsv, write_classic_wide_format, write_feature_counts_tsv,
@@ -60,7 +60,19 @@ pub(crate) fn write_sample_gene_body_plot(
         &data,
         &metadata,
         &format!("{}.{}.geneBodyCoverage.svg", config.output, sample_name),
-    )
+    )?;
+
+    if config.stratify_length && !stats.stratified_percentile_normalized.is_empty() {
+        generate_stratified_gene_body_plot(
+            &stats.stratified_percentile_normalized,
+            &format!(
+                "{}.{}.geneBodyCoverage.stratified.svg",
+                config.output, sample_name
+            ),
+        )?;
+    }
+
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

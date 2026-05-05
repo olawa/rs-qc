@@ -7,11 +7,11 @@ rdna_fraction	0.0000
 requested_pairs	1000000
 informative_pairs	1000000
 inferred_strandness	RF (stranded-reverse)
-geometric_fr_fraction	0.5243
-geometric_rf_fraction	0.4757
+geometric_fr_fraction	0.5244
+geometric_rf_fraction	0.4756
 other_orientation_fraction	0.0000
 pending_evictions	0
-inner_distance_mean	-101.4269
+inner_distance_mean	-101.4307
 inner_distance_median	-116.0000
 stranded_forward_count	18009
 stranded_reverse_count	981991

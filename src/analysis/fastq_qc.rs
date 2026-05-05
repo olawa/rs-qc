@@ -5,8 +5,11 @@ use kuva::prelude::*;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::Path;
+use std::process::{Child, ChildStdout, Command, Stdio};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
 
 const DEFAULT_ADAPTERS: &[&str] = &[
     "AGATCGGAAGAGC",
@@ -19,6 +22,7 @@ const DEFAULT_ADAPTERS: &[&str] = &[
 pub struct FastqQcConfig {
     pub inputs: Vec<String>,
     pub output_prefix: String,
+    pub threads: usize,
     pub sample_size: usize,
     pub kmer_size: usize,
     pub top_n: usize,
@@ -26,6 +30,9 @@ pub struct FastqQcConfig {
     pub no_kmers: bool,
     pub paired: bool,
     pub length_bin_size: usize,
+    pub use_pigz: bool,
+    pub pigz_threads: usize,
+    pub batch_size: usize,
 }
 
 #[derive(Debug, Default)]
@@ -105,8 +112,48 @@ pub struct FastqLengthBin {
     pub cumulative_bases_ge_start: u64,
 }
 
+#[derive(Clone, Debug)]
+struct FastqRecordOwned {
+    name: Vec<u8>,
+    seq: Vec<u8>,
+    qual: Vec<u8>,
+    sampled: bool,
+}
+
+#[derive(Debug)]
+struct FastqBatch {
+    records: Vec<FastqRecordOwned>,
+}
+
+#[derive(Debug)]
+struct PairedFastqBatch {
+    left: Vec<FastqRecordOwned>,
+    right: Vec<FastqRecordOwned>,
+}
+
+#[derive(Debug)]
+enum FastqWorkItem {
+    Single(FastqBatch),
+    Paired(PairedFastqBatch),
+}
+
 impl FastqQcMetrics {
+    #[cfg(test)]
     fn observe(&mut self, seq: &[u8], qual: &[u8], config: &FastqQcConfig) -> Result<()> {
+        self.observe_record(
+            &FastqRecordOwned {
+                name: Vec::new(),
+                seq: seq.to_vec(),
+                qual: qual.to_vec(),
+                sampled: true,
+            },
+            config,
+        )
+    }
+
+    fn observe_record(&mut self, record: &FastqRecordOwned, config: &FastqQcConfig) -> Result<()> {
+        let seq = record.seq.as_slice();
+        let qual = record.qual.as_slice();
         if seq.len() != qual.len() {
             bail!(
                 "FASTQ sequence and quality lengths differ: {} sequence bases vs {} quality scores",
@@ -196,7 +243,7 @@ impl FastqQcMetrics {
             }
         }
 
-        if self.duplicate_sample_reads < config.sample_size as u64 {
+        if record.sampled {
             self.duplicate_sample_reads += 1;
 
             // Use entry pattern without to_string() where possible
@@ -228,6 +275,62 @@ impl FastqQcMetrics {
         }
 
         Ok(())
+    }
+
+    fn merge(mut self, other: Self) -> Self {
+        self.total_reads += other.total_reads;
+        self.total_bases += other.total_bases;
+
+        if self.min_len == 0 || (other.min_len > 0 && other.min_len < self.min_len) {
+            self.min_len = other.min_len;
+        }
+        self.max_len = self.max_len.max(other.max_len);
+
+        for (k, v) in other.length_hist {
+            *self.length_hist.entry(k).or_insert(0) += v;
+        }
+        for (k, v) in other.gc_hist {
+            *self.gc_hist.entry(k).or_insert(0) += v;
+        }
+        for (k, v) in other.mean_quality_hist {
+            *self.mean_quality_hist.entry(k).or_insert(0) += v;
+        }
+        for (k, v) in other.adapter_hits {
+            *self.adapter_hits.entry(k).or_insert(0) += v;
+        }
+        for (k, v) in other.overrepresented_bytes {
+            *self.overrepresented_bytes.entry(k).or_insert(0) += v;
+        }
+        for (k, v) in other.kmers {
+            *self.kmers.entry(k).or_insert(0) += v;
+        }
+
+        self.duplicate_sample_reads += other.duplicate_sample_reads;
+        self.duplicate_sample_unique += other.duplicate_sample_unique;
+        self.poly_a_reads += other.poly_a_reads;
+        self.poly_g_reads += other.poly_g_reads;
+        self.n_reads += other.n_reads;
+        self.paired_reads_checked += other.paired_reads_checked;
+        self.paired_name_mismatches += other.paired_name_mismatches;
+
+        if self.per_base.len() < other.per_base.len() {
+            self.per_base
+                .resize_with(other.per_base.len(), BasePositionMetrics::default);
+        }
+        for (idx, other_pos) in other.per_base.into_iter().enumerate() {
+            let pos = &mut self.per_base[idx];
+            pos.count += other_pos.count;
+            pos.qual_sum += other_pos.qual_sum;
+            for i in 0..pos.bases.len() {
+                pos.bases[i] += other_pos.bases[i];
+            }
+            for (q, c) in other_pos.qual_hist {
+                *pos.qual_hist.entry(q).or_insert(0) += c;
+            }
+            pos.adapter_hits += other_pos.adapter_hits;
+        }
+
+        self
     }
 
     pub fn mean_read_length(&self) -> f64 {
@@ -358,11 +461,17 @@ pub fn run_fastq_qc(config: &FastqQcConfig) -> Result<FastqQcMetrics> {
         if config.inputs.len() != 2 {
             bail!("--paired requires exactly two FASTQ inputs");
         }
-        scan_paired_fastq(&config.inputs[0], &config.inputs[1], config, &mut metrics)?;
+        metrics = metrics.merge(scan_paired_fastq(
+            &config.inputs[0],
+            &config.inputs[1],
+            config,
+        )?);
     } else {
+        let mut observed_reads = 0_u64;
         for input in &config.inputs {
-            scan_fastq(input, config, &mut metrics)
+            let sample_metrics = scan_fastq(input, config, &mut observed_reads)
                 .with_context(|| format!("failed while scanning FASTQ input {input}"))?;
+            metrics = metrics.merge(sample_metrics);
         }
     }
 
@@ -374,101 +483,403 @@ fn scan_paired_fastq(
     left_path: &str,
     right_path: &str,
     config: &FastqQcConfig,
-    metrics: &mut FastqQcMetrics,
-) -> Result<()> {
-    let mut left = open_fastq(left_path)?;
-    let mut right = open_fastq(right_path)?;
-    let mut l = FastqRecordBuffer::default();
-    let mut r = FastqRecordBuffer::default();
+) -> Result<FastqQcMetrics> {
+    scan_fastq_pairs(left_path, right_path, config)
+}
 
-    loop {
-        let left_record = read_record(&mut left, &mut l, left_path)?;
-        let right_record = read_record(&mut right, &mut r, right_path)?;
-        match (left_record, right_record) {
-            (false, false) => break,
-            (true, false) | (false, true) => {
-                bail!("paired FASTQ files have different record counts")
-            }
-            (true, true) => {
-                metrics.paired_reads_checked += 1;
-                if normalized_read_name(&l.name) != normalized_read_name(&r.name) {
-                    metrics.paired_name_mismatches += 1;
+fn scan_fastq(
+    path: &str,
+    config: &FastqQcConfig,
+    observed_reads: &mut u64,
+) -> Result<FastqQcMetrics> {
+    let (metrics, next_observed_reads) = scan_fastq_single(path, config, *observed_reads)?;
+    *observed_reads = next_observed_reads;
+    Ok(metrics)
+}
+
+fn scan_fastq_single(
+    path: &str,
+    config: &FastqQcConfig,
+    observed_reads: u64,
+) -> Result<(FastqQcMetrics, u64)> {
+    let reader = BufReader::with_capacity(
+        1 << 20,
+        open_fastq_reader(path, config.use_pigz, config.pigz_threads)?,
+    );
+    let producer = FastqBatchProducer::new_single(reader, config, observed_reads)?;
+    producer.run()
+}
+
+fn scan_fastq_pairs(
+    left_path: &str,
+    right_path: &str,
+    config: &FastqQcConfig,
+) -> Result<FastqQcMetrics> {
+    let left = BufReader::with_capacity(
+        1 << 20,
+        open_fastq_reader(left_path, config.use_pigz, config.pigz_threads)?,
+    );
+    let right = BufReader::with_capacity(
+        1 << 20,
+        open_fastq_reader(right_path, config.use_pigz, config.pigz_threads)?,
+    );
+    let producer = FastqBatchProducer::new_paired(left, right, config, 0)?;
+    let (metrics, _) = producer.run()?;
+    Ok(metrics)
+}
+
+struct FastqBatchProducer {
+    left: BufReader<Box<dyn Read>>,
+    right: Option<BufReader<Box<dyn Read>>>,
+    config: FastqQcConfig,
+    observed_reads: u64,
+    tx: Option<mpsc::SyncSender<FastqWorkItem>>,
+    rx: Arc<Mutex<mpsc::Receiver<FastqWorkItem>>>,
+}
+
+impl FastqBatchProducer {
+    fn new_single(
+        reader: BufReader<Box<dyn Read>>,
+        config: &FastqQcConfig,
+        observed_reads: u64,
+    ) -> Result<Self> {
+        Self::new(reader, None, config, observed_reads)
+    }
+
+    fn new_paired(
+        left: BufReader<Box<dyn Read>>,
+        right: BufReader<Box<dyn Read>>,
+        config: &FastqQcConfig,
+        observed_reads: u64,
+    ) -> Result<Self> {
+        Self::new(left, Some(right), config, observed_reads)
+    }
+
+    fn new(
+        left: BufReader<Box<dyn Read>>,
+        right: Option<BufReader<Box<dyn Read>>>,
+        config: &FastqQcConfig,
+        observed_reads: u64,
+    ) -> Result<Self> {
+        let worker_threads = worker_thread_count(config);
+        let queue_capacity = worker_threads.saturating_mul(2).max(1);
+        let (tx, rx) = mpsc::sync_channel(queue_capacity);
+        Ok(Self {
+            left,
+            right,
+            config: config.clone(),
+            observed_reads,
+            tx: Some(tx),
+            rx: Arc::new(Mutex::new(rx)),
+        })
+    }
+
+    fn run(mut self) -> Result<(FastqQcMetrics, u64)> {
+        let worker_count = worker_thread_count(&self.config);
+        let worker_config = Arc::new(self.config.clone());
+        let rx = Arc::clone(&self.rx);
+        let mut handles = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let rx = Arc::clone(&rx);
+            let worker_config = Arc::clone(&worker_config);
+            handles.push(thread::spawn(move || worker_loop(rx, worker_config)));
+        }
+
+        if self.right.is_some() {
+            self.produce_paired_batches()?;
+        } else {
+            self.produce_single_batches()?;
+        }
+
+        drop(self.tx.take());
+
+        let mut merged = FastqQcMetrics::default();
+        for handle in handles {
+            let worker_metrics = handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("FASTQ worker thread panicked"))??;
+            merged = merged.merge(worker_metrics);
+        }
+        Ok((merged, self.observed_reads))
+    }
+
+    fn produce_single_batches(&mut self) -> Result<()> {
+        let mut buffer = FastqRecordBuffer::default();
+        let mut batch = FastqBatch {
+            records: Vec::with_capacity(self.config.batch_size.max(1)),
+        };
+        loop {
+            match read_record(
+                &mut self.left,
+                &mut buffer,
+                self.config.sample_size,
+                &mut self.observed_reads,
+                "FASTQ",
+            )? {
+                Some(record) => {
+                    batch.records.push(record);
+                    if batch.records.len() >= self.config.batch_size.max(1) {
+                        self.tx
+                            .as_ref()
+                            .unwrap()
+                            .send(FastqWorkItem::Single(batch))
+                            .map_err(|_| {
+                                anyhow::anyhow!("FASTQ workers stopped receiving batches")
+                            })?;
+                        batch = FastqBatch {
+                            records: Vec::with_capacity(self.config.batch_size.max(1)),
+                        };
+                    }
                 }
-                metrics.observe(
-                    l.seq.trim_end().as_bytes(),
-                    l.qual.trim_end().as_bytes(),
-                    config,
-                )?;
-                metrics.observe(
-                    r.seq.trim_end().as_bytes(),
-                    r.qual.trim_end().as_bytes(),
-                    config,
-                )?;
+                None => break,
             }
         }
+        if !batch.records.is_empty() {
+            self.tx
+                .as_ref()
+                .unwrap()
+                .send(FastqWorkItem::Single(batch))
+                .map_err(|_| anyhow::anyhow!("FASTQ workers stopped receiving batches"))?;
+        }
+        Ok(())
     }
 
-    Ok(())
-}
+    fn produce_paired_batches(&mut self) -> Result<()> {
+        let right = self.right.as_mut().unwrap();
+        let mut left_buffer = FastqRecordBuffer::default();
+        let mut right_buffer = FastqRecordBuffer::default();
+        let mut batch = PairedFastqBatch {
+            left: Vec::with_capacity(self.config.batch_size.max(1)),
+            right: Vec::with_capacity(self.config.batch_size.max(1)),
+        };
+        loop {
+            let left_record = read_record(
+                &mut self.left,
+                &mut left_buffer,
+                self.config.sample_size,
+                &mut self.observed_reads,
+                "left FASTQ",
+            )?;
+            let right_record = read_record(
+                right,
+                &mut right_buffer,
+                self.config.sample_size,
+                &mut self.observed_reads,
+                "right FASTQ",
+            )?;
+            match (left_record, right_record) {
+                (None, None) => break,
+                (Some(_), None) | (None, Some(_)) => {
+                    bail!("paired FASTQ files have different record counts")
+                }
+                (Some(left), Some(right)) => {
+                    batch.left.push(left);
+                    batch.right.push(right);
+                    if batch.left.len() >= self.config.batch_size.max(1) {
+                        self.tx
+                            .as_ref()
+                            .unwrap()
+                            .send(FastqWorkItem::Paired(batch))
+                            .map_err(|_| {
+                                anyhow::anyhow!("FASTQ workers stopped receiving batches")
+                            })?;
+                        batch = PairedFastqBatch {
+                            left: Vec::with_capacity(self.config.batch_size.max(1)),
+                            right: Vec::with_capacity(self.config.batch_size.max(1)),
+                        };
+                    }
+                }
+            }
+        }
 
-fn scan_fastq(path: &str, config: &FastqQcConfig, metrics: &mut FastqQcMetrics) -> Result<()> {
-    let mut reader = open_fastq(path)?;
-    let mut record = FastqRecordBuffer::default();
-
-    while read_record(&mut reader, &mut record, path)? {
-        metrics.observe(
-            record.seq.trim_end().as_bytes(),
-            record.qual.trim_end().as_bytes(),
-            config,
-        )?;
+        if !batch.left.is_empty() {
+            self.tx
+                .as_ref()
+                .unwrap()
+                .send(FastqWorkItem::Paired(batch))
+                .map_err(|_| anyhow::anyhow!("FASTQ workers stopped receiving batches"))?;
+        }
+        Ok(())
     }
-
-    Ok(())
 }
 
-#[derive(Default)]
 struct FastqRecordBuffer {
-    name: String,
-    seq: String,
-    plus: String,
-    qual: String,
+    name: Vec<u8>,
+    seq: Vec<u8>,
+    plus: Vec<u8>,
+    qual: Vec<u8>,
+}
+
+impl Default for FastqRecordBuffer {
+    fn default() -> Self {
+        Self {
+            name: Vec::new(),
+            seq: Vec::new(),
+            plus: Vec::new(),
+            qual: Vec::new(),
+        }
+    }
+}
+
+fn worker_loop(
+    rx: Arc<Mutex<mpsc::Receiver<FastqWorkItem>>>,
+    config: Arc<FastqQcConfig>,
+) -> Result<FastqQcMetrics> {
+    let mut metrics = FastqQcMetrics::default();
+    loop {
+        let work = {
+            let guard = rx.lock().unwrap();
+            guard.recv()
+        };
+        match work {
+            Ok(FastqWorkItem::Single(batch)) => {
+                process_single_batch(&mut metrics, batch, &config)?;
+            }
+            Ok(FastqWorkItem::Paired(batch)) => {
+                process_paired_batch(&mut metrics, batch, &config)?;
+            }
+            Err(_) => break,
+        }
+    }
+    Ok(metrics)
+}
+
+fn process_single_batch(
+    metrics: &mut FastqQcMetrics,
+    batch: FastqBatch,
+    config: &FastqQcConfig,
+) -> Result<()> {
+    for record in batch.records {
+        metrics.observe_record(&record, config)?;
+    }
+    Ok(())
+}
+
+fn process_paired_batch(
+    metrics: &mut FastqQcMetrics,
+    batch: PairedFastqBatch,
+    config: &FastqQcConfig,
+) -> Result<()> {
+    for (left, right) in batch.left.into_iter().zip(batch.right.into_iter()) {
+        metrics.paired_reads_checked += 1;
+        if normalized_read_name(&left.name) != normalized_read_name(&right.name) {
+            metrics.paired_name_mismatches += 1;
+        }
+        metrics.observe_record(&left, config)?;
+        metrics.observe_record(&right, config)?;
+    }
+    Ok(())
 }
 
 fn read_record<R: BufRead + ?Sized>(
     reader: &mut R,
     record: &mut FastqRecordBuffer,
+    sample_size: usize,
+    observed_reads: &mut u64,
     path: &str,
-) -> Result<bool> {
+) -> Result<Option<FastqRecordOwned>> {
     record.name.clear();
-    if reader.read_line(&mut record.name)? == 0 {
-        return Ok(false);
+    if read_fastq_line(reader, &mut record.name)? == 0 {
+        return Ok(None);
     }
     record.seq.clear();
     record.plus.clear();
     record.qual.clear();
-    if reader.read_line(&mut record.seq)? == 0
-        || reader.read_line(&mut record.plus)? == 0
-        || reader.read_line(&mut record.qual)? == 0
+    if read_fastq_line(reader, &mut record.seq)? == 0
+        || read_fastq_line(reader, &mut record.plus)? == 0
+        || read_fastq_line(reader, &mut record.qual)? == 0
     {
         bail!("truncated FASTQ record in {path}");
     }
 
-    if !record.name.starts_with('@') {
+    if !record.name.starts_with(b"@") {
         bail!("invalid FASTQ record in {path}: header does not start with @");
     }
-    if !record.plus.starts_with('+') {
+    if !record.plus.starts_with(b"+") {
         bail!("invalid FASTQ record in {path}: separator does not start with +");
     }
 
-    Ok(true)
+    let sampled = *observed_reads < sample_size as u64;
+    *observed_reads += 1;
+
+    Ok(Some(FastqRecordOwned {
+        name: std::mem::take(&mut record.name),
+        seq: std::mem::take(&mut record.seq),
+        qual: std::mem::take(&mut record.qual),
+        sampled,
+    }))
 }
 
-fn open_fastq(path: &str) -> Result<Box<dyn BufRead>> {
+fn read_fastq_line<R: BufRead + ?Sized>(reader: &mut R, buf: &mut Vec<u8>) -> Result<usize> {
+    buf.clear();
+    let n = reader.read_until(b'\n', buf)?;
+    if n == 0 {
+        return Ok(0);
+    }
+    while matches!(buf.last(), Some(b'\n' | b'\r')) {
+        buf.pop();
+    }
+    Ok(n)
+}
+
+fn open_fastq_reader(path: &str, use_pigz: bool, pigz_threads: usize) -> Result<Box<dyn Read>> {
+    if use_pigz && path.ends_with(".gz") {
+        match open_pigz_reader(path, pigz_threads) {
+            Ok(reader) => return Ok(Box::new(reader)),
+            Err(err) => {
+                eprintln!(
+                    "pigz unavailable for {path}: {err}; falling back to internal gzip reader"
+                );
+            }
+        }
+    }
     let file = File::open(path).with_context(|| format!("could not open {path}"))?;
     if path.ends_with(".gz") {
-        Ok(Box::new(BufReader::new(MultiGzDecoder::new(file))))
+        Ok(Box::new(MultiGzDecoder::new(file)))
     } else {
-        Ok(Box::new(BufReader::new(file)))
+        Ok(Box::new(file))
+    }
+}
+
+fn open_pigz_reader(path: &str, pigz_threads: usize) -> Result<PigzReader> {
+    let mut child = Command::new("pigz")
+        .arg("-dc")
+        .arg("-p")
+        .arg(pigz_threads.max(1).to_string())
+        .arg(path)
+        .stdout(Stdio::piped())
+        .stdin(Stdio::null())
+        .spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("pigz did not provide stdout"))?;
+    Ok(PigzReader { child, stdout })
+}
+
+struct PigzReader {
+    child: Child,
+    stdout: ChildStdout,
+}
+
+impl Read for PigzReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.stdout.read(buf)
+    }
+}
+
+impl Drop for PigzReader {
+    fn drop(&mut self) {
+        let _ = self.child.wait();
+    }
+}
+
+fn worker_thread_count(config: &FastqQcConfig) -> usize {
+    let threads = config.threads.max(1);
+    if config.use_pigz {
+        threads.saturating_sub(config.pigz_threads.max(1)).max(1)
+    } else {
+        threads
     }
 }
 
@@ -526,55 +937,7 @@ fn write_outputs(config: &FastqQcConfig, metrics: &FastqQcMetrics) -> Result<()>
         &config.output_prefix,
         &summary,
     )?;
-    write_per_base_metrics(config, metrics)?;
     Ok(())
-}
-
-fn write_per_base_metrics(config: &FastqQcConfig, metrics: &FastqQcMetrics) -> Result<()> {
-    let mut out = File::create(format!("{}.fastq.per_base.tsv", config.output_prefix))?;
-    writeln!(
-        out,
-        "pos\tcount\tA\tC\tG\tT\tN\tmean_qual\tmedian_qual\tadapter_hits"
-    )?;
-    for (i, p) in metrics.per_base.iter().enumerate() {
-        let mean_q = if p.count > 0 {
-            p.qual_sum as f64 / p.count as f64
-        } else {
-            0.0
-        };
-        let median_q = calculate_median(&p.qual_hist);
-        writeln!(
-            out,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.2}\t{}\t{}",
-            i + 1,
-            p.count,
-            p.bases[0],
-            p.bases[1],
-            p.bases[2],
-            p.bases[3],
-            p.bases[4],
-            mean_q,
-            median_q,
-            p.adapter_hits
-        )?;
-    }
-    Ok(())
-}
-
-fn calculate_median(hist: &BTreeMap<u8, u64>) -> u8 {
-    let total: u64 = hist.values().sum();
-    if total == 0 {
-        return 0;
-    }
-    let mut seen = 0;
-    let target = total / 2;
-    for (&q, &c) in hist {
-        seen += c;
-        if seen >= target {
-            return q;
-        }
-    }
-    0
 }
 
 fn write_summary(config: &FastqQcConfig, metrics: &FastqQcMetrics) -> Result<()> {
@@ -733,10 +1096,6 @@ fn find_substring(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window.eq_ignore_ascii_case(needle))
 }
 
-fn contains_ascii(haystack: &[u8], needle: &[u8]) -> bool {
-    find_substring(haystack, needle).is_some()
-}
-
 fn has_poly_tail(seq: &[u8], base: u8, min_run: usize) -> bool {
     let base = base.to_ascii_uppercase();
     let mut run = 0;
@@ -753,7 +1112,8 @@ fn has_poly_tail(seq: &[u8], base: u8, min_run: usize) -> bool {
     false
 }
 
-fn normalized_read_name(name: &str) -> String {
+fn normalized_read_name(name: &[u8]) -> String {
+    let name = String::from_utf8_lossy(name);
     let name = name.trim_start_matches('@').trim();
     let name = name.split_whitespace().next().unwrap_or(name);
     name.trim_end_matches("/1")
@@ -781,6 +1141,7 @@ mod tests {
         let config = FastqQcConfig {
             inputs: Vec::new(),
             output_prefix: "unused".to_string(),
+            threads: 1,
             sample_size: 10,
             kmer_size: 3,
             top_n: 10,
@@ -788,6 +1149,9 @@ mod tests {
             no_kmers: false,
             paired: false,
             length_bin_size: 1000,
+            use_pigz: false,
+            pigz_threads: 1,
+            batch_size: 16,
         };
         let mut metrics = FastqQcMetrics::default();
         metrics.observe(b"ACGTNN", b"IIIIII", &config).unwrap();
