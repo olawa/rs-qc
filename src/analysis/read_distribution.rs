@@ -56,15 +56,22 @@ impl FeatureMap {
 
     pub fn set_region(&mut self, start: u64, end: u64, region: RegionType) {
         let region_val = region as u8;
-        for pos in start..end {
-            let win_idx = (pos / self.window_size) as usize;
-            let offset = (pos % self.window_size) as usize;
+        let mut curr = start;
+        while curr < end {
+            let win_idx = (curr / self.window_size) as usize;
+            let win_start = (curr % self.window_size) as usize;
+            let win_remaining = self.window_size as usize - win_start;
+            let len = (end - curr).min(win_remaining as u64) as usize;
+
             if win_idx < self.data.len() {
-                let current = self.data[win_idx][offset];
-                if region_val < current {
-                    self.data[win_idx][offset] = region_val;
+                let slice = &mut self.data[win_idx][win_start..win_start + len];
+                for val in slice.iter_mut() {
+                    if region_val < *val {
+                        *val = region_val;
+                    }
                 }
             }
+            curr += len as u64;
         }
     }
 
@@ -128,7 +135,7 @@ pub fn apply_gene_to_map(gene: &Gene, map: &mut FeatureMap) {
                 }
             }
         } else {
-            map.set_region(exon.start, exon.end, RegionType::Utr5Exon);
+            map.set_region(exon.start, exon.end, RegionType::Exon);
         }
     }
 
@@ -182,23 +189,26 @@ pub fn build_feature_maps(
     genes: &[Gene],
     chrom_sizes: &HashMap<String, u64>,
 ) -> HashMap<String, FeatureMap> {
-    let mut maps = HashMap::new();
-    let window_size = 1_000_000;
+    use rayon::prelude::*;
 
-    for (chrom, &size) in chrom_sizes {
-        // chrom is already normalized here because chrom_sizes was built with normalized keys
-        maps.insert(
-            chrom.clone(),
-            FeatureMap::new(chrom.clone(), size, window_size),
-        );
-    }
-
+    let mut chrom_to_genes = HashMap::new();
     for gene in genes {
-        let norm_chrom = crate::models::normalize_chrom(&gene.chrom);
-        if let Some(map) = maps.get_mut(&norm_chrom) {
-            apply_gene_to_map(gene, map);
-        }
+        chrom_to_genes
+            .entry(crate::models::normalize_chrom(&gene.chrom).into_owned())
+            .or_insert_with(Vec::new)
+            .push(gene);
     }
 
-    maps
+    chrom_sizes
+        .par_iter()
+        .map(|(chrom, &size)| {
+            let mut map = FeatureMap::new(chrom.clone(), size, 1_000_000);
+            if let Some(genes) = chrom_to_genes.get(chrom) {
+                for gene in genes {
+                    apply_gene_to_map(gene, &mut map);
+                }
+            }
+            (chrom.clone(), map)
+        })
+        .collect()
 }

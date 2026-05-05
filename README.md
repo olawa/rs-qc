@@ -35,14 +35,13 @@ The project intentionally starts with a strong RNA-seq core, but the shape is br
 - `rs-qc align` for general BAM/CRAM alignment QC
 - `rs-qc rna` for RNA-seq QC with RSeQC-style metrics
 - `rs-qc dna` for mosdepth-like coverage and breadth QC
+- `rs-qc snap` for static genomic region snapshots
 - `rs-qc report` for unified JSON and HTML reporting
 
 The CLI also exposes planned subcommands for future expansion:
 
-- `rs-qc dna`
 - `rs-qc atac`
 - `rs-qc contam`
-- `rs-qc report`
 
 ## Features
 
@@ -121,6 +120,29 @@ rs-qc rna \
 rs-qc dna -i sample.bam -o sample_dna --window-size 100000 --targets panel.bed
 ```
 
+### Contamination
+
+```bash
+rs-qc contam \
+  -i sample.bam \
+  -o sample_contam \
+  --rdna-bed rdna.bed \
+  --rrna-fasta rrna_refs.fa \
+  --kmer-size 31 \
+  --min-kmer-hits 2
+```
+
+### Region snapshot
+
+```bash
+rs-qc snap \
+  -i sample.bam \
+  -r chr22:28600000-28602000 \
+  -a gencode.gtf.gz \
+  --reference hg38.fa \
+  -o sample.chr22.snap.png
+```
+
 ## Output Files
 
 Each module writes plain-text or TSV outputs with the chosen output prefix.
@@ -130,6 +152,9 @@ Examples:
 - `sample.fastq.summary.txt`
 - `sample.fastq.summary.json`
 - `sample.fastq.per_base.tsv`
+- `sample.fastq.length_distribution.tsv`
+- `sample.fastq.length_bins.tsv`
+- `sample.fastq.length_distribution.svg`
 - `sample.align.summary.txt`
 - `sample.align.summary.json`
 - `sample.align.mapq.tsv`
@@ -145,6 +170,9 @@ Examples:
 - `sample.dna.contigs.tsv`
 - `sample.dna.windows.tsv`
 - `sample.dna.targets.tsv`
+- `sample.contam.summary.tsv`
+- `sample.contam.summary.json`
+- `sample.chr22.snap.png`
 
 This structured output is intentional: it makes the future JSON and HTML report layer much easier to build without re-running the scan.
 
@@ -159,9 +187,8 @@ This structured output is intentional: it makes the future JSON and HTML report 
 
 Planned next steps include:
 
-- `rs-qc dna` with mosdepth-like coverage metrics
-- `rs-qc contam` with contaminant and species screening
 - `rs-qc atac` for ATAC/ChIP-style metrics
+- species-level contamination sketches or marker-kmer screens
 - richer HTML report cards and warning badges
 
 ## Notes
@@ -170,6 +197,7 @@ Planned next steps include:
 - BAM input is currently the most mature alignment path.
 - CRAM support is planned, but BAM is the current focus.
 - DNA coverage uses a simple coordinate-sweep accumulator, not the RNA transcript index.
+- Region snapshots keep `region_plot` as a pure renderer; BAM, FASTA, and annotation extraction live in `rs-qc`.
 
 ## More Docs
 

@@ -51,57 +51,80 @@ pub struct FeatureIndex {
 
 impl FeatureIndex {
     pub fn build(transcripts: &[ParsedTranscript]) -> Self {
-        let mut chrom_events: HashMap<String, Vec<FeatureEvent>> = HashMap::new();
+        use rayon::prelude::*;
 
+        // Group transcripts by chromosome
+        let mut chrom_transcripts: HashMap<String, Vec<&ParsedTranscript>> = HashMap::new();
         for tx in transcripts {
-            let events = chrom_events.entry(tx.chrom.clone()).or_default();
-            emit_transcript_events(tx, events);
+            chrom_transcripts
+                .entry(tx.chrom.clone())
+                .or_default()
+                .push(tx);
         }
 
-        let mut chroms = HashMap::new();
-        let mut feature_sizes: HashMap<RegionType, u64> = HashMap::new();
+        let results: Vec<_> = chrom_transcripts
+            .into_par_iter()
+            .map(|(chrom, txs)| {
+                let mut events = Vec::new();
+                for tx in txs {
+                    emit_transcript_events(tx, &mut events);
+                }
 
-        for (chrom, mut events) in chrom_events {
-            if events.is_empty() {
-                continue;
-            }
+                if events.is_empty() {
+                    return (chrom, None, HashMap::new());
+                }
 
-            events.sort_by(|a, b| a.pos.cmp(&b.pos));
+                events.sort_by(|a, b| a.pos.cmp(&b.pos));
 
-            let mut active = [0i32; 12];
-            let mut intervals = Vec::<FeatureInterval>::new();
-            let mut prev_pos: Option<u64> = None;
-            let mut i = 0usize;
+                let mut active = [0i32; 12];
+                let mut intervals = Vec::<FeatureInterval>::new();
+                let mut sizes: HashMap<RegionType, u64> = HashMap::new();
+                let mut prev_pos: Option<u64> = None;
+                let mut i = 0usize;
 
-            while i < events.len() {
-                let pos = events[i].pos;
+                while i < events.len() {
+                    let pos = events[i].pos;
 
-                if let Some(prev) = prev_pos {
-                    if prev < pos {
-                        let region = pick_region(&active);
-                        if region != RegionType::Intergenic {
-                            let len = pos - prev;
-                            *feature_sizes.entry(region).or_insert(0) += len;
-                            push_interval(&mut intervals, prev, pos, region);
+                    if let Some(prev) = prev_pos {
+                        if prev < pos {
+                            let region = pick_region(&active);
+                            if region != RegionType::Intergenic {
+                                let len = pos - prev;
+                                *sizes.entry(region).or_insert(0) += len;
+                                push_interval(&mut intervals, prev, pos, region);
+                            }
                         }
                     }
+
+                    while i < events.len() && events[i].pos == pos {
+                        let region_idx = events[i].region as usize;
+                        active[region_idx] += events[i].delta;
+                        i += 1;
+                    }
+                    prev_pos = Some(pos);
                 }
 
-                while i < events.len() && events[i].pos == pos {
-                    let region_idx = events[i].region as usize;
-                    active[region_idx] += events[i].delta;
-                    i += 1;
-                }
-                prev_pos = Some(pos);
-            }
-
-            if !intervals.is_empty() {
-                chroms.insert(
-                    chrom,
-                    Arc::new(ChromFeatureIndex {
+                let index = if !intervals.is_empty() {
+                    Some(Arc::new(ChromFeatureIndex {
                         intervals: intervals.into(),
-                    }),
-                );
+                    }))
+                } else {
+                    None
+                };
+
+                (chrom, index, sizes)
+            })
+            .collect();
+
+        let mut chroms = HashMap::new();
+        let mut feature_sizes = HashMap::new();
+
+        for (chrom, maybe_index, sizes) in results {
+            if let Some(index) = maybe_index {
+                chroms.insert(chrom, index);
+            }
+            for (region, size) in sizes {
+                *feature_sizes.entry(region).or_insert(0) += size;
             }
         }
 

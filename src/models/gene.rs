@@ -1,6 +1,6 @@
 use crate::models::Transcript;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 /// A pre-computed mapping from genomic offset to biological 5' spliced position.
@@ -75,11 +75,11 @@ pub struct Gene {
     pub representative: Transcript,
     pub bin_map: Arc<GeneBinMap>,
 
-    // Shared Atomic Accumlators (Not serialized)
+    // Shared Atomic Accumulators (Direct counts, not diffs)
     #[serde(skip, default = "empty_arc_vec")]
-    pub diff_3p: Arc<Vec<AtomicI32>>,
+    pub counts_3p: Arc<Vec<AtomicU32>>,
     #[serde(skip, default = "empty_arc_vec")]
-    pub diff_percentile: Arc<Vec<AtomicI32>>,
+    pub counts_percentile: Arc<Vec<AtomicU32>>,
 }
 
 fn empty_arc_vec<T>() -> Arc<Vec<T>> {
@@ -87,11 +87,18 @@ fn empty_arc_vec<T>() -> Arc<Vec<T>> {
 }
 
 impl Gene {
-    pub fn new(id: String, name: Option<String>, tx: Transcript, max_3p_dist: usize) -> Self {
+    pub fn new(
+        id: String,
+        name: Option<String>,
+        tx: Transcript,
+        max_3p_dist: usize,
+        bin_size: usize,
+    ) -> Self {
         let total_len = tx.total_length as u32;
         let biotype = tx.biotype.clone();
         let bin_map = GeneBinMap::new(&tx);
         let chrom = tx.chrom.clone();
+        let n_3p_bins = (max_3p_dist + bin_size - 1) / bin_size;
 
         Self {
             id,
@@ -101,47 +108,36 @@ impl Gene {
             total_len,
             representative: tx,
             bin_map: Arc::new(bin_map),
-            diff_3p: Arc::new((0..=max_3p_dist).map(|_| AtomicI32::new(0)).collect()),
-            diff_percentile: Arc::new((0..101).map(|_| AtomicI32::new(0)).collect()),
+            counts_3p: Arc::new((0..n_3p_bins).map(|_| AtomicU32::new(0)).collect()),
+            counts_percentile: Arc::new((0..100).map(|_| AtomicU32::new(0)).collect()),
         }
     }
 
-    // Removed unused add_coverage_at_genomic_range as it's replaced by thread-local logic.
-
-    /// Apply thread-local accumulated differences to the global atomics.
-    pub fn apply_local_updates(&self, d_3p: &[i32], d_pct: &[i32]) {
-        for (i, &val) in d_3p.iter().enumerate() {
-            if val != 0 && i < self.diff_3p.len() {
-                self.diff_3p[i].fetch_add(val, Ordering::Relaxed);
-            }
-        }
-        for (i, &val) in d_pct.iter().enumerate() {
-            if val != 0 && i < self.diff_percentile.len() {
-                self.diff_percentile[i].fetch_add(val, Ordering::Relaxed);
-            }
+    pub fn add_percentile(&self, idx: usize, delta: u32) {
+        if idx < self.counts_percentile.len() {
+            self.counts_percentile[idx].fetch_add(delta, Ordering::Relaxed);
         }
     }
 
-    pub fn finalize_coverage(&self, diff: &[AtomicI32], out: &mut [u32]) {
-        let mut curr = 0i32;
-        for i in 0..out.len() {
-            curr += diff[i].load(Ordering::Relaxed);
-            out[i] = curr.max(0) as u32;
+    pub fn add_3p(&self, idx: usize, delta: u32) {
+        if idx < self.counts_3p.len() {
+            self.counts_3p[idx].fetch_add(delta, Ordering::Relaxed);
         }
     }
 
     pub fn reset_coverage(&self) {
-        for v in self.diff_3p.iter() {
+        for v in self.counts_3p.iter() {
             v.store(0, Ordering::Relaxed);
         }
-        for v in self.diff_percentile.iter() {
+        for v in self.counts_percentile.iter() {
             v.store(0, Ordering::Relaxed);
         }
     }
 
-    pub fn reinitialize_atomics(&mut self, max_3p_dist: usize) {
-        self.diff_3p = Arc::new((0..=max_3p_dist).map(|_| AtomicI32::new(0)).collect());
-        self.diff_percentile = Arc::new((0..101).map(|_| AtomicI32::new(0)).collect());
+    pub fn reinitialize_atomics(&mut self, max_3p_dist: usize, bin_size: usize) {
+        let n_3p_bins = (max_3p_dist + bin_size - 1) / bin_size;
+        self.counts_3p = Arc::new((0..n_3p_bins).map(|_| AtomicU32::new(0)).collect());
+        self.counts_percentile = Arc::new((0..100).map(|_| AtomicU32::new(0)).collect());
     }
 }
 
@@ -155,8 +151,8 @@ impl Clone for Gene {
             total_len: self.total_len,
             representative: self.representative.clone(),
             bin_map: Arc::clone(&self.bin_map),
-            diff_3p: Arc::clone(&self.diff_3p),
-            diff_percentile: Arc::clone(&self.diff_percentile),
+            counts_3p: Arc::clone(&self.counts_3p),
+            counts_percentile: Arc::clone(&self.counts_percentile),
         }
     }
 }

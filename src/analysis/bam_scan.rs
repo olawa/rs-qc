@@ -16,6 +16,7 @@ pub struct BamScanConfig {
 #[derive(Clone, Debug)]
 pub struct BamWindow {
     pub chrom: String,
+    pub chrom_norm: String,
     pub start: u32,
     pub end: u32,
 }
@@ -24,12 +25,14 @@ pub fn generate_windows(header: &sam::Header, chunk_size: usize) -> Vec<BamWindo
     let mut windows = Vec::new();
     for (name, seq) in header.reference_sequences() {
         let chrom = String::from_utf8_lossy(name.as_ref()).to_string();
+        let chrom_norm = crate::models::normalize_chrom(&chrom).into_owned();
         let len = seq.length().get() as u32;
         let mut start = 0;
         while start < len {
             let end = (start + chunk_size as u32).min(len);
             windows.push(BamWindow {
                 chrom: chrom.clone(),
+                chrom_norm: chrom_norm.clone(),
                 start,
                 end,
             });
@@ -102,20 +105,22 @@ pub fn record_is_owned_by_window(record: &bam::Record, window: &BamWindow) -> bo
     start >= window.start as u64 && start < window.end as u64
 }
 
-pub fn scan_bam_windows<T, Make, Visit, Merge>(
+pub fn scan_bam_windows_full<T, Make, Visit, Finalize, Merge>(
     bam_path: &str,
     bai_path: &str,
     chunk_size: usize,
     show_progress: bool,
     make_state: Make,
     visit: Visit,
+    finalize: Finalize,
     merge: Merge,
 ) -> Result<T>
 where
     T: Send,
-    Make: Fn() -> T + Sync,
-    Visit: Fn(&mut T, &sam::Header, &BamWindow, &bam::Record) + Sync,
-    Merge: Fn(T, T) -> T,
+    Make: Fn() -> T + Sync + Send,
+    Visit: Fn(&mut T, &sam::Header, &BamWindow, &bam::Record) + Sync + Send,
+    Finalize: Fn(&mut T, &BamWindow) + Sync + Send,
+    Merge: Fn(T, T) -> T + Sync + Send,
 {
     let header = {
         let file = File::open(bam_path).with_context(|| format!("could not open {bam_path}"))?;
@@ -154,6 +159,7 @@ where
                     visit(&mut state, &header, window, &record);
                 }
             }
+            finalize(&mut state, window);
             if let Some(pb) = &pb {
                 pb.inc(1);
             }
@@ -165,5 +171,32 @@ where
         pb.finish_with_message("Window scan finished.");
     }
 
-    Ok(states.into_iter().reduce(merge).unwrap_or_else(make_state))
+    Ok(states.into_par_iter().reduce(make_state, merge))
+}
+
+pub fn scan_bam_windows<T, Make, Visit, Merge>(
+    bam_path: &str,
+    bai_path: &str,
+    chunk_size: usize,
+    show_progress: bool,
+    make_state: Make,
+    visit: Visit,
+    merge: Merge,
+) -> Result<T>
+where
+    T: Send,
+    Make: Fn() -> T + Sync + Send,
+    Visit: Fn(&mut T, &sam::Header, &BamWindow, &bam::Record) + Sync + Send,
+    Merge: Fn(T, T) -> T + Sync + Send,
+{
+    scan_bam_windows_full(
+        bam_path,
+        bai_path,
+        chunk_size,
+        show_progress,
+        make_state,
+        visit,
+        |_state, _window| {},
+        merge,
+    )
 }

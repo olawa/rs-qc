@@ -1,0 +1,15 @@
+metric	value
+aligned_qc_reads	3759530
+mtdna_reads	0
+mtdna_fraction	0.0000
+rdna_reads	0
+rdna_fraction	0.0000
+requested_pairs	6625000
+informative_pairs	100084
+inferred_strandness	unstranded_or_mixed
+fr_fraction	0.2633
+rf_fraction	0.7367
+other_fraction	0.0000
+pending_evictions	0
+inner_distance_mean	13.2082
+inner_distance_median	-92.0000

@@ -8,4 +8,6 @@ pub mod index;
 pub mod qc;
 pub mod read_distribution;
 pub mod report;
+pub mod rna_qc;
+pub mod snapshot;
 pub mod types;

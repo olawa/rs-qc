@@ -1,4 +1,4 @@
-use crate::models::Exon;
+use crate::models::{normalize_chrom, Exon};
 use anyhow::Result;
 use noodles::bam;
 use noodles::sam;
@@ -97,8 +97,9 @@ impl Iterator for BamFragmentIterator {
                 .unwrap_or_default();
 
             if !flags.is_segmented() {
-                let blocks = get_aligned_blocks(&record);
-                let chrom = get_chrom(&self.header, &record);
+                let blocks = aligned_blocks(&record);
+                let chrom =
+                    reference_name(&self.header, &record).unwrap_or_else(|| "unknown".to_string());
                 return Some(Ok(QcMolecule::Single {
                     chrom,
                     blocks,
@@ -117,7 +118,8 @@ impl Iterator for BamFragmentIterator {
                     .map(|id| usize::from(id));
 
                 if id_rec == id_mate && id_rec.is_some() && is_sane_orientation(&record, &mate) {
-                    let chrom = get_chrom(&self.header, &record);
+                    let chrom = reference_name(&self.header, &record)
+                        .unwrap_or_else(|| "unknown".to_string());
                     let record_is_first = flags.is_first_segment();
                     let mate_flags = mate.flags();
 
@@ -126,16 +128,16 @@ impl Iterator for BamFragmentIterator {
                             || (!mate_flags.is_first_segment() && !mate_flags.is_last_segment())
                         {
                             (
-                                get_aligned_blocks(&record),
+                                aligned_blocks(&record),
                                 flags.is_reverse_complemented(),
-                                get_aligned_blocks(&mate),
+                                aligned_blocks(&mate),
                                 mate_flags.is_reverse_complemented(),
                             )
                         } else {
                             (
-                                get_aligned_blocks(&mate),
+                                aligned_blocks(&mate),
                                 mate_flags.is_reverse_complemented(),
-                                get_aligned_blocks(&record),
+                                aligned_blocks(&record),
                                 flags.is_reverse_complemented(),
                             )
                         };
@@ -161,8 +163,9 @@ impl Iterator for BamFragmentIterator {
                         eprintln!("WARNING: Fragment buffer exceeded 1M records. Are you using a coordinate-sorted BAM with many orphans? Dropping new orphans to save memory.");
                     }
                     self.orphans_count += 1;
-                    let blocks = get_aligned_blocks(&record);
-                    let chrom = get_chrom(&self.header, &record);
+                    let blocks = aligned_blocks(&record);
+                    let chrom = reference_name(&self.header, &record)
+                        .unwrap_or_else(|| "unknown".to_string());
                     return Some(Ok(QcMolecule::Single {
                         chrom,
                         blocks,
@@ -181,41 +184,97 @@ fn is_sane_orientation(r1: &bam::Record, r2: &bam::Record) -> bool {
     f1.is_reverse_complemented() != f2.is_reverse_complemented()
 }
 
-fn get_aligned_blocks(record: &bam::Record) -> Vec<Exon> {
-    let mut blocks = Vec::new();
-    let start = match record.alignment_start() {
-        Some(Ok(s)) => s.get() as u64 - 1,
-        _ => return blocks,
+pub fn reference_name(header: &sam::Header, record: &bam::Record) -> Option<String> {
+    let id = record.reference_sequence_id()?.ok()?;
+    header
+        .reference_sequences()
+        .get_index(usize::from(id))
+        .map(|(name, _)| String::from_utf8_lossy(name.as_ref()).to_string())
+}
+
+pub fn normalized_reference_name(header: &sam::Header, record: &bam::Record) -> Option<String> {
+    reference_name(header, record).map(|name| normalize_chrom(&name).into_owned())
+}
+
+#[derive(Debug, Clone)]
+pub struct ReferenceNames {
+    raw: Vec<String>,
+    normalized: Vec<String>,
+}
+
+impl ReferenceNames {
+    pub fn new(header: &sam::Header) -> Self {
+        let raw: Vec<_> = header
+            .reference_sequences()
+            .iter()
+            .map(|(name, _)| String::from_utf8_lossy(name.as_ref()).to_string())
+            .collect();
+        let normalized = raw
+            .iter()
+            .map(|name| normalize_chrom(name).into_owned())
+            .collect();
+        Self { raw, normalized }
+    }
+
+    pub fn raw(&self, record: &bam::Record) -> Option<&str> {
+        let id = record.reference_sequence_id()?.ok()?;
+        self.raw.get(usize::from(id)).map(String::as_str)
+    }
+
+    pub fn normalized(&self, record: &bam::Record) -> Option<&str> {
+        let id = record.reference_sequence_id()?.ok()?;
+        self.normalized.get(usize::from(id)).map(String::as_str)
+    }
+}
+
+pub fn alignment_start_0(record: &bam::Record) -> Option<u64> {
+    record.alignment_start()?.ok().map(|p| p.get() as u64 - 1)
+}
+
+pub fn reference_span(record: &bam::Record) -> Option<(u64, u64)> {
+    let start = alignment_start_0(record)?;
+    let mut end = start;
+    for op in record.cigar().iter().filter_map(Result::ok) {
+        if op.kind().consumes_reference() {
+            end += op.len() as u64;
+        }
+    }
+    Some((start, end))
+}
+
+pub fn match_span(record: &bam::Record) -> Option<(u64, u64)> {
+    let mut first = None;
+    let mut last = None;
+    for_each_aligned_block(record, |start, end| {
+        first.get_or_insert(start);
+        last = Some(end);
+    });
+    Some((first?, last?))
+}
+
+pub fn for_each_aligned_block(record: &bam::Record, mut visit: impl FnMut(u64, u64)) {
+    let Some(start) = alignment_start_0(record) else {
+        return;
     };
 
     let mut curr_pos = start;
-    let cigar = record.cigar();
-    for op_res in cigar.iter() {
-        if let Ok(op) = op_res {
-            match op.kind() {
-                Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
-                    let end = curr_pos + op.len() as u64;
-                    blocks.push(Exon {
-                        start: curr_pos,
-                        end,
-                    });
-                    curr_pos = end;
-                }
-                Kind::Deletion | Kind::Skip => {
-                    curr_pos += op.len() as u64;
-                }
-                _ => {}
+    for op in record.cigar().iter().filter_map(Result::ok) {
+        match op.kind() {
+            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
+                let end = curr_pos + op.len() as u64;
+                visit(curr_pos, end);
+                curr_pos = end;
             }
+            Kind::Deletion | Kind::Skip => {
+                curr_pos += op.len() as u64;
+            }
+            _ => {}
         }
     }
-    blocks
 }
 
-fn get_chrom(header: &sam::Header, record: &bam::Record) -> String {
-    if let Some(Ok(id)) = record.reference_sequence_id() {
-        if let Some((name, _)) = header.reference_sequences().get_index(id) {
-            return String::from_utf8_lossy(name.as_ref()).to_string();
-        }
-    }
-    "unknown".to_string()
+pub fn aligned_blocks(record: &bam::Record) -> Vec<Exon> {
+    let mut blocks = Vec::new();
+    for_each_aligned_block(record, |start, end| blocks.push(Exon { start, end }));
+    blocks
 }

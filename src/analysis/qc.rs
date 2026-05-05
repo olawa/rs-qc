@@ -1,3 +1,5 @@
+use crate::io::bam::match_span;
+use noodles::bam;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::File;
@@ -10,6 +12,9 @@ pub struct ReadEndObservation {
     pub last_match: u64,
     pub is_first: bool,
     pub is_reverse: bool,
+    pub gene_strand: Option<char>,
+    pub gene_idx: Option<usize>,
+    pub aligned_len: u64,
 }
 
 #[derive(Debug, Default, Clone, Serialize)]
@@ -22,11 +27,22 @@ pub struct RnaSeqQcSummary {
     pub fr_count: usize,
     pub rf_count: usize,
     pub other_orientation_count: usize,
+    pub stranded_forward_count: usize,
+    pub stranded_reverse_count: usize,
     pub pending_evictions: usize,
     pub inner_distances: Vec<i64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadEndType {
+    FivePrime,
+    ThreePrime,
+}
+
 impl RnaSeqQcSummary {
+    pub fn observe_inner_distance(&mut self, dist: i32) {
+        self.inner_distances.push(dist as i64);
+    }
     pub fn mtdna_fraction(&self) -> f64 {
         frac_u64(self.mtdna_reads, self.aligned_qc_reads)
     }
@@ -48,16 +64,30 @@ impl RnaSeqQcSummary {
     }
 
     pub fn inferred_strandness(&self) -> &'static str {
-        let fr = self.fr_fraction();
-        let rf = self.rf_fraction();
-        if self.informative_pairs == 0 {
-            "undetermined"
-        } else if fr >= 0.8 {
-            "FR"
-        } else if rf >= 0.8 {
-            "RF"
+        let stranded_total = self.stranded_forward_count + self.stranded_reverse_count;
+        if stranded_total < 100 {
+            // Not enough annotated overlap to infer strandedness reliably
+            let fr = self.fr_fraction();
+            let rf = self.rf_fraction();
+            if self.informative_pairs == 0 {
+                "undetermined"
+            } else if fr >= 0.8 {
+                "FR (geom)"
+            } else if rf >= 0.8 {
+                "RF (geom)"
+            } else {
+                "mixed (geom)"
+            }
         } else {
-            "unstranded_or_mixed"
+            let f_frac = self.stranded_forward_count as f64 / stranded_total as f64;
+            let r_frac = self.stranded_reverse_count as f64 / stranded_total as f64;
+            if f_frac >= 0.8 {
+                "FR (stranded-forward)"
+            } else if r_frac >= 0.8 {
+                "RF (stranded-reverse)"
+            } else {
+                "unstranded/mixed"
+            }
         }
     }
 
@@ -117,9 +147,18 @@ impl RnaSeqQcSummary {
             "inferred_strandness\t{}\n",
             self.inferred_strandness()
         ));
-        out.push_str(&format!("fr_fraction\t{:.4}\n", self.fr_fraction()));
-        out.push_str(&format!("rf_fraction\t{:.4}\n", self.rf_fraction()));
-        out.push_str(&format!("other_fraction\t{:.4}\n", self.other_fraction()));
+        out.push_str(&format!(
+            "geometric_fr_fraction\t{:.4}\n",
+            self.fr_fraction()
+        ));
+        out.push_str(&format!(
+            "geometric_rf_fraction\t{:.4}\n",
+            self.rf_fraction()
+        ));
+        out.push_str(&format!(
+            "other_orientation_fraction\t{:.4}\n",
+            self.other_fraction()
+        ));
         out.push_str(&format!("pending_evictions\t{}\n", self.pending_evictions));
         out.push_str(&format!(
             "inner_distance_mean\t{}\n",
@@ -133,6 +172,8 @@ impl RnaSeqQcSummary {
                 .map(|v| format!("{:.4}", v))
                 .unwrap_or_else(|| "NA".to_string())
         ));
+        out.push_str(&format!("stranded_forward_count\t{}\n", self.stranded_forward_count));
+        out.push_str(&format!("stranded_reverse_count\t{}\n", self.stranded_reverse_count));
         out
     }
 
@@ -153,8 +194,7 @@ impl RnaSeqQcSummary {
 
 #[derive(Debug, Clone)]
 pub struct InlineQcState {
-    target_pairs: usize,
-    pending_limit: usize,
+    pub qc_sample_size: usize,
     pub summary: RnaSeqQcSummary,
     pending: HashMap<Vec<u8>, ReadEndObservation>,
     pending_order: VecDeque<Vec<u8>>,
@@ -169,10 +209,9 @@ impl Default for InlineQcState {
 impl InlineQcState {
     pub fn new(target_pairs: usize) -> Self {
         let target_pairs = target_pairs.max(1);
-        let pending_limit = target_pairs.max(2);
+        let _pending_limit = target_pairs.max(2);
         Self {
-            target_pairs,
-            pending_limit,
+            qc_sample_size: target_pairs,
             summary: RnaSeqQcSummary {
                 requested_pairs: target_pairs,
                 ..RnaSeqQcSummary::default()
@@ -183,11 +222,12 @@ impl InlineQcState {
     }
 
     pub fn needs_more(&self) -> bool {
-        self.summary.informative_pairs < self.target_pairs
+        self.summary.informative_pairs < self.qc_sample_size
     }
 
     fn evict_oldest_pending(&mut self) {
-        while self.pending.len() >= self.pending_limit {
+        let pending_limit = self.qc_sample_size.max(2);
+        while self.pending.len() >= pending_limit {
             let Some(qname) = self.pending_order.pop_front() else {
                 break;
             };
@@ -225,11 +265,102 @@ impl InlineQcState {
         }
     }
 
+    pub fn observe_read_end(
+        &mut self,
+        record: &bam::Record,
+        chrom: &str,
+        dense: &crate::analysis::index::DenseMap,
+        _genes: &[crate::models::Gene],
+        _end_type: ReadEndType,
+    ) {
+        if !self.needs_more() {
+            return;
+        }
+
+        let flags = record.flags();
+        let Some(qname) = record.name().map(|n| n.as_ref().to_vec()) else {
+            return;
+        };
+        let Some((start, end)) = match_span(record) else {
+            return;
+        };
+
+        // Aligned length excluding introns (N)
+        let aligned_len = record.cigar().iter().map(|result| {
+            let op = result.expect("Invalid CIGAR op");
+            use noodles::sam::alignment::record::cigar::op::Kind;
+            match op.kind() {
+                Kind::Match |
+                Kind::Deletion |
+                Kind::Insertion |
+                Kind::SequenceMatch |
+                Kind::SequenceMismatch => op.len() as u64,
+                _ => 0
+            }
+        }).sum();
+
+        // Determine if this read end overlaps a gene on a specific strand
+        let mut gene_strand = None;
+        let mut gene_idx = None;
+        let mid = start + (end - start) / 2;
+        use crate::analysis::index::Hits;
+        match dense.get_hits(mid) {
+            Hits::Single(g_idx) => {
+                gene_idx = Some(g_idx as usize);
+                gene_strand = Some(_genes[g_idx as usize].representative.strand);
+            }
+            Hits::Multi(indices) => {
+                // If all genes have the same strand, we can use it
+                let strands: Vec<char> = indices.iter().map(|&idx| _genes[idx as usize].representative.strand).collect();
+                if strands.iter().all(|&s| s == strands[0]) {
+                    gene_strand = Some(strands[0]);
+                    // If multiple genes, just pick the first for index
+                    gene_idx = Some(indices[0] as usize);
+                }
+            }
+            Hits::None => {}
+        }
+
+        let obs = ReadEndObservation {
+            chrom: chrom.to_string(),
+            first_match: start,
+            last_match: end,
+            is_first: flags.is_first_segment(),
+            is_reverse: flags.is_reverse_complemented(),
+            gene_strand,
+            gene_idx,
+            aligned_len,
+        };
+
+        if let Some((r1, r2)) = self.observe_end(qname, obs) {
+            if r1.chrom == r2.chrom {
+                // Only use pairs where both hit the same gene for inner distance
+                if let (Some(g1), Some(g2)) = (r1.gene_idx, r2.gene_idx) {
+                    if g1 == g2 {
+                        let gene = &_genes[g1];
+                        let p1 = r1.first_match.min(r2.first_match);
+                        let p2 = r1.last_match.max(r2.last_match).saturating_sub(1);
+                        
+                        if let (Some(s1), Some(s2)) = (gene.bin_map.get_spliced_5p(p1), gene.bin_map.get_spliced_5p(p2)) {
+                            let spliced_frag_len = (s1 as i64 - s2 as i64).abs() + 1;
+                            let inner = spliced_frag_len - (r1.aligned_len as i64 + r2.aligned_len as i64);
+                            
+                            // Filter for reasonable inner distance (-1000 to 2000 bp)
+                            if inner >= -1000 && inner <= 2000 {
+                                self.record_pair(inner, &r1, &r2);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub fn record_pair(
         &mut self,
         inner_distance: i64,
-        read1_is_reverse: bool,
-        read2_is_reverse: bool,
+        r1: &ReadEndObservation,
+        r2: &ReadEndObservation,
     ) {
         if !self.needs_more() {
             return;
@@ -238,19 +369,44 @@ impl InlineQcState {
         self.summary.inner_distances.push(inner_distance);
         self.summary.informative_pairs += 1;
 
-        match (read1_is_reverse, read2_is_reverse) {
+        // Geometric orientation
+        match (r1.is_reverse, r2.is_reverse) {
             (false, true) => self.summary.fr_count += 1,
             (true, false) => self.summary.rf_count += 1,
             _ => self.summary.other_orientation_count += 1,
         }
+
+        // Annotation-relative strandness
+        // R1: match(rev, strand=='+') -> RF, else FR
+        // R2: match(rev, strand=='+') -> FR, else RF
+        if let Some(strand) = r1.gene_strand {
+            let matches = r1.is_reverse == (strand == '+');
+            if matches {
+                self.summary.stranded_reverse_count += 1;
+            } else {
+                self.summary.stranded_forward_count += 1;
+            }
+        } else if let Some(strand) = r2.gene_strand {
+            let matches = r2.is_reverse == (strand == '+');
+            if matches {
+                self.summary.stranded_forward_count += 1;
+            } else {
+                self.summary.stranded_reverse_count += 1;
+            }
+        }
     }
 
     pub fn merge_from(&mut self, other: Self) {
-        self.summary.requested_pairs += other.summary.requested_pairs;
+        self.summary.aligned_qc_reads += other.summary.aligned_qc_reads;
+        self.summary.mtdna_reads += other.summary.mtdna_reads;
+        self.summary.rdna_reads += other.summary.rdna_reads;
+        // requested_pairs is the target, don't sum it.
         self.summary.informative_pairs += other.summary.informative_pairs;
         self.summary.fr_count += other.summary.fr_count;
         self.summary.rf_count += other.summary.rf_count;
         self.summary.other_orientation_count += other.summary.other_orientation_count;
+        self.summary.stranded_forward_count += other.summary.stranded_forward_count;
+        self.summary.stranded_reverse_count += other.summary.stranded_reverse_count;
         self.summary.pending_evictions += other.summary.pending_evictions;
         self.summary
             .inner_distances
@@ -287,6 +443,9 @@ mod tests {
             last_match: 19,
             is_first: true,
             is_reverse: false,
+            gene_strand: Some('+'),
+            gene_idx: Some(0),
+            aligned_len: 10,
         };
         let read2 = ReadEndObservation {
             chrom: "chr1".to_string(),
@@ -294,11 +453,14 @@ mod tests {
             last_match: 39,
             is_first: false,
             is_reverse: true,
+            gene_strand: Some('+'),
+            gene_idx: Some(0),
+            aligned_len: 10,
         };
 
-        assert!(qc.observe_end(b"r1".to_vec(), read1).is_none());
-        let pair = qc.observe_end(b"r1".to_vec(), read2).unwrap();
-        qc.record_pair(10, pair.0.is_reverse, pair.1.is_reverse);
+        assert!(qc.observe_end(b"r1".to_vec(), read1.clone()).is_none());
+        let pair = qc.observe_end(b"r1".to_vec(), read2.clone()).unwrap();
+        qc.record_pair(10, &pair.0, &pair.1);
 
         assert_eq!(qc.summary.informative_pairs, 1);
         assert_eq!(qc.summary.fr_count, 1);
@@ -314,6 +476,9 @@ mod tests {
             last_match: pos + 10,
             is_first: true,
             is_reverse: false,
+            gene_strand: None,
+            gene_idx: None,
+            aligned_len: 10,
         };
 
         let _ = qc.observe_end(b"r1".to_vec(), read("chr1", 10));

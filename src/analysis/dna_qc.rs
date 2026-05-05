@@ -1,10 +1,10 @@
 use crate::analysis::bam_scan::scan_bam_stream;
 use crate::analysis::report::write_summary_json;
+use crate::io::bam::{for_each_aligned_block, normalized_reference_name};
 use crate::models::normalize_chrom;
 use anyhow::{bail, Context, Result};
 use noodles::bam;
 use noodles::sam;
-use noodles::sam::alignment::record::cigar::op::Kind;
 use serde::Serialize;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap};
@@ -17,9 +17,17 @@ const BREADTH_THRESHOLDS: [u32; 5] = [1, 5, 10, 20, 30];
 pub struct DnaQcConfig {
     pub inputs: Vec<String>,
     pub output_prefix: String,
-    pub window_size: usize,
-    pub target_bed: Option<String>,
+    pub mapq_threshold: u8,
     pub threads: usize,
+    pub window_size: u32,
+    pub targets_path: Option<String>,
+    pub thresholds: Vec<u32>,
+    pub callable_depth: u32,
+    pub include_duplicates: bool,
+    pub reference_fasta: Option<String>,
+    pub annotation_path: Option<String>,
+    pub low_cov_threshold: u32,
+    pub snap_lowcov: u32,
     pub show_progress: bool,
 }
 
@@ -35,7 +43,7 @@ pub struct DnaQcMetrics {
     pub windows: BTreeMap<String, DnaWindowAccumulator>,
     pub targets: BTreeMap<String, DnaTargetAccumulator>,
     pub target_bed: Option<String>,
-    pub window_size: usize,
+    pub window_size: u32,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -99,7 +107,7 @@ pub struct DnaQcSummary {
     pub windows: Vec<DnaWindowAccumulator>,
     pub targets: Vec<DnaTargetAccumulator>,
     pub target_bed: Option<String>,
-    pub window_size: usize,
+    pub window_size: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -263,7 +271,7 @@ pub fn run_dna_qc(config: &DnaQcConfig) -> Result<DnaQcMetrics> {
     }
 
     let mut metrics = DnaQcMetrics {
-        target_bed: config.target_bed.clone(),
+        target_bed: config.targets_path.clone(),
         window_size: config.window_size,
         ..DnaQcMetrics::default()
     };
@@ -284,7 +292,7 @@ fn scan_dna_file(path: &str, config: &DnaQcConfig) -> Result<DnaQcMetrics> {
     }
 
     let header = read_header(path)?;
-    let state = DnaCoverageState::new(&header, config.window_size, config.target_bed.as_deref())?;
+    let state = DnaCoverageState::new(&header, config.window_size, config.targets_path.as_deref())?;
     let metrics = scan_bam_stream(
         path,
         &crate::analysis::bam_scan::BamScanConfig {
@@ -315,7 +323,7 @@ struct DnaCoverageState {
 }
 
 impl DnaCoverageState {
-    fn new(header: &sam::Header, window_size: usize, target_bed: Option<&str>) -> Result<Self> {
+    fn new(header: &sam::Header, window_size: u32, target_bed: Option<&str>) -> Result<Self> {
         let mut metrics = DnaQcMetrics {
             window_size,
             ..DnaQcMetrics::default()
@@ -325,7 +333,8 @@ impl DnaCoverageState {
         let mut total_reference_bases = 0_u64;
 
         for (name, seq) in header.reference_sequences() {
-            let chrom = normalize_chrom(String::from_utf8_lossy(name.as_ref()).as_ref());
+            let chrom =
+                normalize_chrom(String::from_utf8_lossy(name.as_ref()).as_ref()).into_owned();
             let length = seq.length().get() as u64;
             total_reference_bases += length;
             reference_lengths.insert(chrom.clone(), length);
@@ -412,7 +421,7 @@ impl DnaCoverageState {
             return;
         }
 
-        let Some(chrom) = reference_name(header, record) else {
+        let Some(chrom) = normalized_reference_name(header, record) else {
             return;
         };
         let Some(contig_len) = self.reference_lengths.get(&chrom).copied() else {
@@ -420,34 +429,11 @@ impl DnaCoverageState {
         };
         self.ensure_current(&chrom, contig_len);
 
-        let Some(start) = record
-            .alignment_start()
-            .and_then(|p| p.ok())
-            .map(|p| p.get() as u64 - 1)
-        else {
-            return;
-        };
-
-        let mut ref_pos = start;
-        for op_res in record.cigar().iter() {
-            let Ok(op) = op_res else {
-                continue;
-            };
-            match op.kind() {
-                Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
-                    let block_start = ref_pos;
-                    let block_end = ref_pos + op.len() as u64;
-                    self.metrics.total_aligned_bases += op.len() as u64;
-                    self.advance_to(block_start);
-                    self.push_interval(block_end);
-                    ref_pos = block_end;
-                }
-                Kind::Deletion | Kind::Skip => {
-                    ref_pos += op.len() as u64;
-                }
-                _ => {}
-            }
-        }
+        for_each_aligned_block(record, |start, end| {
+            self.metrics.total_aligned_bases += end - start;
+            self.advance_to(start);
+            self.push_interval(end);
+        });
     }
 
     fn ensure_current(&mut self, chrom: &str, length: u64) {
@@ -639,7 +625,7 @@ fn load_targets(path: &str) -> Result<Vec<TargetSpec>> {
             .unwrap_or_else(|| format!("{}:{}-{}", chrom, start, end));
         if start < end {
             targets.push(TargetSpec {
-                chrom,
+                chrom: chrom.into_owned(),
                 start,
                 end,
                 name,
@@ -701,14 +687,6 @@ impl MergeableAccumulator for DnaTargetAccumulator {
         self.bases_ge_20x += other.bases_ge_20x;
         self.bases_ge_30x += other.bases_ge_30x;
     }
-}
-
-fn reference_name(header: &sam::Header, record: &bam::Record) -> Option<String> {
-    let id = record.reference_sequence_id()?.ok()?;
-    header
-        .reference_sequences()
-        .get_index(usize::from(id))
-        .map(|(name, _)| normalize_chrom(String::from_utf8_lossy(name.as_ref()).as_ref()))
 }
 
 fn breadth_bases(depth_hist: &BTreeMap<u32, u64>, threshold: u32) -> u64 {

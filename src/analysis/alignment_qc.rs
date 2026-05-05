@@ -1,5 +1,6 @@
 use crate::analysis::bam_scan::{scan_bam_stream, BamScanConfig};
 use crate::analysis::report::write_summary_json;
+use crate::io::bam::ReferenceNames;
 use anyhow::{bail, Context, Result};
 use noodles::bam;
 use noodles::sam;
@@ -114,7 +115,13 @@ impl AccuracyMetrics {
 }
 
 impl AlignmentQcMetrics {
-    fn observe_record(&mut self, header: &sam::Header, record: &bam::Record, mapq_threshold: u8) {
+    fn observe_record(
+        &mut self,
+        _header: &sam::Header,
+        record: &bam::Record,
+        mapq_threshold: u8,
+        ref_names: &ReferenceNames,
+    ) {
         self.total_records += 1;
 
         let flags = record.flags();
@@ -174,9 +181,18 @@ impl AlignmentQcMetrics {
         for op_res in record.cigar().iter() {
             if let Ok(op) = op_res {
                 let len = op.len() as u64;
-                let label = cigar_label(op.kind());
-                *self.cigar_op_bases.entry(label.to_string()).or_insert(0) += len;
-                match op.kind() {
+                let kind = op.kind();
+                let label = cigar_label(kind);
+
+                // Use a more efficient entry pattern
+                match self.cigar_op_bases.get_mut(label) {
+                    Some(count) => *count += len,
+                    None => {
+                        self.cigar_op_bases.insert(label.to_string(), len);
+                    }
+                }
+
+                match kind {
                     Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
                         aligned_match_bases += len;
                         reference_consuming_bases += len;
@@ -192,13 +208,16 @@ impl AlignmentQcMetrics {
         }
         self.total_aligned_match_bases += aligned_match_bases;
 
-        let contig = reference_name(header, record).unwrap_or_else(|| {
-            if flags.is_unmapped() {
-                "*".to_string()
-            } else {
-                "unknown".to_string()
-            }
-        });
+        let contig = ref_names
+            .raw(record)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| {
+                if flags.is_unmapped() {
+                    "*".to_string()
+                } else {
+                    "unknown".to_string()
+                }
+            });
         let contig_metrics = self.per_contig.entry(contig).or_default();
         contig_metrics.records += 1;
         if !flags.is_unmapped() {
@@ -239,6 +258,7 @@ fn scan_alignment(
         bail!("CRAM input is planned, but this build currently supports BAM for rs-qc align");
     }
 
+    let mut ref_names = None;
     scan_bam_stream(
         path,
         &BamScanConfig {
@@ -247,7 +267,15 @@ fn scan_alignment(
         },
         metrics,
         |state, header, record| {
-            state.observe_record(header, record, config.mapq_threshold);
+            if ref_names.is_none() {
+                ref_names = Some(ReferenceNames::new(header));
+            }
+            state.observe_record(
+                header,
+                record,
+                config.mapq_threshold,
+                ref_names.as_ref().unwrap(),
+            );
         },
     )
 }
@@ -410,14 +438,6 @@ where
         writeln!(out, "{k}\t{v}")?;
     }
     Ok(())
-}
-
-fn reference_name(header: &sam::Header, record: &bam::Record) -> Option<String> {
-    let id = record.reference_sequence_id()?.ok()?;
-    header
-        .reference_sequences()
-        .get_index(usize::from(id))
-        .map(|(name, _)| String::from_utf8_lossy(name.as_ref()).to_string())
 }
 
 fn de_tag(record: &bam::Record) -> Option<f32> {

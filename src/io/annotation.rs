@@ -64,15 +64,16 @@ pub struct AnnotationConfig {
     pub three_prime_cluster_window: u64,
     pub min_transcript_length: u64,
     pub max_3p_dist: usize,
+    pub three_prime_bin_size: usize,
     pub transcript_centric: bool,
     /// If true, only transcripts on the '+' strand are loaded.
     pub plus_strand_only: bool,
     /// Which isoform to use as representative when a gene has multiple eligible transcripts.
     pub isoform_select: IsoformSelect,
-    /// If true, genes whose isoforms have 3' ends spread wider than
-    /// `three_prime_cluster_window` are excluded entirely. This removes genes
-    /// with alternative polyadenylation that would introduce 3' UTR artefacts
-    /// in the gene body coverage plot.
+    /// Deprecated compatibility flag. 3' sanity filtering is applied during
+    /// coverage aggregation based on observed terminal coverage, not while
+    /// loading transcripts, so gene-body coverage can still use the selected
+    /// representative isoform.
     pub strict_cluster: bool,
 }
 
@@ -407,19 +408,20 @@ fn build_genes_from_transcripts(
                     meta.gene_name,
                     tx,
                     config.max_3p_dist,
+                    config.three_prime_bin_size,
                 ));
             }
         } else {
-            // STANDARD: Cluster filter and select representative isoform.
+            // STANDARD: Track divergent 3' annotations for reporting, then select
+            // one representative isoform. Coverage is still collected for the
+            // selected transcript; 3' sanity filtering happens later from the
+            // observed terminal coverage window.
             ends.sort_unstable();
             let min_3p = ends[0];
             let max_3p = ends[ends.len() - 1];
 
             if max_3p - min_3p > config.three_prime_cluster_window {
                 divergent_count += 1;
-                if config.strict_cluster {
-                    continue; // Drop genes with divergent 3' ends
-                }
             }
 
             // Sort eligible by spliced length for median/shortest/longest selection.
@@ -438,6 +440,7 @@ fn build_genes_from_transcripts(
                 target_meta.gene_name,
                 target_tx,
                 config.max_3p_dist,
+                config.three_prime_bin_size,
             ));
         }
     }
@@ -448,9 +451,14 @@ fn build_genes_from_transcripts(
     }
     if divergent_count > 0 {
         println!(
-            "  - Note: Used longest isoform for {} genes with divergent 3' ends (>{}bp).",
+            "  - Note: Selected representative isoforms for {} genes with divergent 3' ends (>{}bp).",
             divergent_count, config.three_prime_cluster_window
         );
+        if config.strict_cluster {
+            println!(
+                "  - Note: --strict-cluster is handled by observed 3' coverage during aggregation."
+            );
+        }
     }
 
     genes
@@ -509,7 +517,8 @@ chr1	custom	exon	301	400	.	+	.	gene_id "G1"; transcript_id "T1";
             biotype_filter: None,
             three_prime_cluster_window: 50,
             min_transcript_length: 100,
-            max_3p_dist: 1000,
+            max_3p_dist: 15000,
+            three_prime_bin_size: 50,
             transcript_centric: false,
             plus_strand_only: false,
             isoform_select: IsoformSelect::Longest,
@@ -547,7 +556,8 @@ chr1	custom	exon	301	400	.	+	.	gene_id "G1"; transcript_id "T1";
             biotype_filter: None,
             three_prime_cluster_window: 50,
             min_transcript_length: 100,
-            max_3p_dist: 1000,
+            max_3p_dist: 15000,
+            three_prime_bin_size: 50,
             transcript_centric: false,
             plus_strand_only: false,
             isoform_select: IsoformSelect::Longest,
@@ -595,7 +605,8 @@ chr1	custom	exon	101	200	.	+	.	gene_id "G1"; transcript_id "T1";
             biotype_filter: None,
             three_prime_cluster_window: 50,
             min_transcript_length: 100,
-            max_3p_dist: 1000,
+            max_3p_dist: 15000,
+            three_prime_bin_size: 50,
             transcript_centric: false,
             plus_strand_only: false,
             isoform_select: IsoformSelect::Longest,

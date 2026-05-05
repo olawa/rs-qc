@@ -14,6 +14,7 @@ Useful options:
 
 - `--sample-size` for sampled duplication and k-mer tracking
 - `--kmer-size` to tune the k-mer screen
+- `--length-bin-size` to tune long-read length histogram bins
 - `--top-n` to control how many overrepresented sequences are reported
 - `--no-kmers` to skip k-mer counting
 
@@ -62,6 +63,45 @@ Useful options:
 - `--rdna-bed` for explicit rDNA interval annotation
 - `--rdna-contigs` for contig-name-based rDNA detection
 
+## Snapshot
+
+Static genomic region snapshots with coverage, reads, CIGAR events, optional annotation, and optional reference bases.
+
+```bash
+rs-qc snap \
+  -i sample.bam \
+  -r chr22:28600000-28602000 \
+  -a gencode.gtf.gz \
+  --reference hg38.fa \
+  -o sample.chr22.snap.png
+```
+
+Useful options:
+
+- `--max-reads` to cap displayed reads
+- `--sample-reads` to reservoir-sample displayed reads when the region is crowded
+- `--no-reference` or `--no-genes` to suppress optional tracks
+- `--format` to require `png` or `svg` output
+
+## Contamination
+
+Aligned mtDNA/rDNA summaries plus optional exact k-mer screening against rRNA references.
+
+```bash
+rs-qc contam \
+  -i sample.bam \
+  -o sample_contam \
+  --rdna-bed rdna.bed \
+  --rrna-fasta rrna_refs.fa
+```
+
+Useful options:
+
+- `--rdna-contigs` for contig-name-based rDNA/rRNA detection
+- `--rrna-fasta` to build an exact rRNA k-mer screen
+- `--sample-size` to cap the number of reads used for the k-mer estimate
+- `--kmer-scan-all-reads` to screen all reads instead of unmapped/low-MAPQ reads
+
 ## Report
 
 Render a unified JSON and HTML report from existing module summaries.
@@ -81,7 +121,6 @@ Useful inputs:
 These are exposed in the CLI shell already, but are not implemented yet:
 
 - `rs-qc atac`
-- `rs-qc contam`
 
 ## Output
 

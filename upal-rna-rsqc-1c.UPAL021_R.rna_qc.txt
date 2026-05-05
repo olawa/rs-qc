@@ -1,0 +1,17 @@
+metric	value
+aligned_qc_reads	159538918
+mtdna_reads	8633006
+mtdna_fraction	0.0541
+rdna_reads	0
+rdna_fraction	0.0000
+requested_pairs	1000000
+informative_pairs	1000000
+inferred_strandness	RF (stranded-reverse)
+geometric_fr_fraction	0.5243
+geometric_rf_fraction	0.4757
+other_orientation_fraction	0.0000
+pending_evictions	0
+inner_distance_mean	-101.4269
+inner_distance_median	-116.0000
+stranded_forward_count	18009
+stranded_reverse_count	981991

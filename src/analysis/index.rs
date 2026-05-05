@@ -12,13 +12,15 @@ pub struct AnnotationIndex {
     pub feature_sizes: HashMap<RegionType, u64>,
     // We will build dense maps per-chromosome as needed to save memory
     pub chrom_spans: HashMap<String, (u64, u64)>,
+    pub genes_by_chrom: HashMap<String, Vec<usize>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DenseMap {
     pub offset: u64,
     pub map: Vec<u32>, // 0 = None, N < 0x80000000 = genes[N-1] + 1, N >= 0x80000000 = multi_map index
-    pub multi_map: Vec<Vec<u32>>,
+    pub multi_data: Vec<u32>,
+    pub multi_offsets: Vec<u32>,
 }
 
 pub enum Hits<'a> {
@@ -32,9 +34,10 @@ impl AnnotationIndex {
         let genes = Arc::new(genes);
         let mut chrom_spans: HashMap<String, (u64, u64)> = HashMap::new();
         let mut chrom_max: HashMap<String, u64> = HashMap::new();
+        let mut genes_by_chrom: HashMap<String, Vec<usize>> = HashMap::new();
 
-        for gene in genes.iter() {
-            let chrom = normalize_chrom(&gene.chrom);
+        for (i, gene) in genes.iter().enumerate() {
+            let chrom = normalize_chrom(&gene.chrom).into_owned();
             let span = (
                 gene.bin_map.offset,
                 gene.bin_map.offset + gene.bin_map.bins.len() as u64,
@@ -43,9 +46,10 @@ impl AnnotationIndex {
             entry.0 = entry.0.min(span.0);
             entry.1 = entry.1.max(span.1);
 
-            let current_max = chrom_max.entry(chrom).or_insert(0);
+            let current_max = chrom_max.entry(chrom.clone()).or_insert(0);
             *current_max = (*current_max).max(gene.representative.genomic_span().1 + 10000);
-            // include TES buffer
+
+            genes_by_chrom.entry(chrom).or_default().push(i);
         }
 
         let mut feature_sizes = HashMap::new();
@@ -75,30 +79,27 @@ impl AnnotationIndex {
         }
 
         Self {
-            version: 2,
+            version: 3,
             genes,
             feature_sizes,
             chrom_spans,
+            genes_by_chrom,
         }
     }
 
     pub fn build_dense_map(&self, chrom: &str) -> Option<DenseMap> {
         let chrom_norm = normalize_chrom(chrom);
-        let (start, end) = self.chrom_spans.get(&chrom_norm)?;
+        let (start, end) = self.chrom_spans.get(chrom_norm.as_ref())?;
         let len = (end - start) as usize;
 
+        let gene_indices = self.genes_by_chrom.get(chrom_norm.as_ref())?;
+
         // Stage 1: Single array to track hits.
-        // 0: no hit
-        // g_idx + 1: single hit
-        // u32::MAX: multiple hits (indices stored in multi_map_temp)
         let mut map_base = vec![0u32; len];
         let mut multi_map_temp: HashMap<usize, Vec<u32>> = HashMap::new();
 
-        for (i, gene) in self.genes.iter().enumerate() {
-            if normalize_chrom(&gene.chrom) != chrom_norm {
-                continue;
-            }
-
+        for &i in gene_indices {
+            let gene = &self.genes[i];
             let g_idx = i as u32;
             let g_offset = gene.bin_map.offset;
 
@@ -113,7 +114,6 @@ impl AnnotationIndex {
                         } else if current == u32::MAX {
                             multi_map_temp.get_mut(&idx).unwrap().push(g_idx);
                         } else {
-                            // First time an overlap is detected for this base
                             let prev_g_idx = current - 1;
                             map_base[idx] = u32::MAX;
                             multi_map_temp.insert(idx, vec![prev_g_idx, g_idx]);
@@ -124,15 +124,22 @@ impl AnnotationIndex {
         }
 
         // Stage 2: Finalize into the compact DenseMap format
-        let mut multi_map = Vec::new();
-        let mut map = vec![0u32; len];
+        let mut multi_data = Vec::new();
+        let mut multi_offsets = Vec::new();
+        multi_offsets.push(0u32);
 
-        // We need a stable mapping from position to multi_map index
+        let mut map = vec![0u32; len];
         let mut pos_to_m_idx: HashMap<usize, u32> = HashMap::new();
 
-        for (idx, hits) in multi_map_temp {
-            let m_idx = multi_map.len() as u32;
-            multi_map.push(hits);
+        // Sort positions to ensure stable multi_map indexing and potentially better locality
+        let mut multi_positions: Vec<_> = multi_map_temp.keys().cloned().collect();
+        multi_positions.sort_unstable();
+
+        for idx in multi_positions {
+            let hits = multi_map_temp.get(&idx).unwrap();
+            let m_idx = (multi_offsets.len() - 1) as u32;
+            multi_data.extend_from_slice(hits);
+            multi_offsets.push(multi_data.len() as u32);
             pos_to_m_idx.insert(idx, m_idx | 0x80000000);
         }
 
@@ -147,18 +154,18 @@ impl AnnotationIndex {
         Some(DenseMap {
             offset: *start,
             map,
-            multi_map,
+            multi_data,
+            multi_offsets,
         })
     }
 
     pub fn build_feature_map(&self, chrom: &str, size: u64) -> Option<FeatureMap> {
         let chrom_norm = normalize_chrom(chrom);
+        let gene_indices = self.genes_by_chrom.get(chrom_norm.as_ref())?;
         let mut map = FeatureMap::new(chrom.to_string(), size, 1_000_000);
 
-        for gene in self.genes.iter() {
-            if normalize_chrom(&gene.chrom) == chrom_norm {
-                crate::analysis::read_distribution::apply_gene_to_map(gene, &mut map);
-            }
+        for &i in gene_indices {
+            crate::analysis::read_distribution::apply_gene_to_map(&self.genes[i], &mut map);
         }
 
         Some(map)
@@ -177,21 +184,21 @@ impl AnnotationIndex {
         Ok(())
     }
 
-    pub fn load_from_file(path: &str, max_3p_dist: usize) -> anyhow::Result<Self> {
+    pub fn load_from_file(path: &str, max_3p_dist: usize, bin_size: usize) -> anyhow::Result<Self> {
         let f = std::fs::File::open(path)?;
         let reader = std::io::BufReader::new(f);
         let mut index: Self = bincode::deserialize_from(reader)?;
 
-        if index.version < 2 {
+        if index.version < 3 {
             anyhow::bail!(
-                "Incompatible index version ({} < 2). Please delete old index and regenerate.",
+                "Incompatible index version ({} < 3). Please delete old index and regenerate.",
                 index.version
             );
         }
 
         let genes = Arc::get_mut(&mut index.genes).ok_or_else(|| anyhow::anyhow!("Arc busy"))?;
         for gene in genes {
-            gene.reinitialize_atomics(max_3p_dist);
+            gene.reinitialize_atomics(max_3p_dist, bin_size);
         }
 
         Ok(index)
@@ -216,7 +223,9 @@ impl DenseMap {
             Hits::Single(val - 1)
         } else {
             let m_idx = (val & 0x7FFFFFFF) as usize;
-            Hits::Multi(&self.multi_map[m_idx])
+            let start = self.multi_offsets[m_idx] as usize;
+            let end = self.multi_offsets[m_idx + 1] as usize;
+            Hits::Multi(&self.multi_data[start..end])
         }
     }
 }

@@ -1,6 +1,7 @@
 use crate::analysis::report::write_summary_json;
 use anyhow::{bail, Context, Result};
 use flate2::read::MultiGzDecoder;
+use kuva::prelude::*;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
@@ -24,6 +25,7 @@ pub struct FastqQcConfig {
     pub phred_offset: u8,
     pub no_kmers: bool,
     pub paired: bool,
+    pub length_bin_size: usize,
 }
 
 #[derive(Debug, Default)]
@@ -36,8 +38,8 @@ pub struct FastqQcMetrics {
     pub length_hist: BTreeMap<usize, u64>,
     pub gc_hist: BTreeMap<u8, u64>,
     pub mean_quality_hist: BTreeMap<u8, u64>,
-    pub adapter_hits: BTreeMap<String, u64>,
-    pub overrepresented: HashMap<String, u64>,
+    pub adapter_hits: HashMap<String, u64>,
+    pub overrepresented_bytes: HashMap<Vec<u8>, u64>,
     pub kmers: HashMap<Vec<u8>, u64>,
     pub duplicate_sample_reads: u64,
     pub duplicate_sample_unique: u64,
@@ -53,6 +55,8 @@ pub struct BasePositionMetrics {
     pub count: u64,
     pub qual_sum: u64,
     pub bases: [u64; 5],
+    pub qual_hist: BTreeMap<u8, u64>,
+    pub adapter_hits: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -74,6 +78,7 @@ pub struct FastqQcSummary {
     pub min_len: usize,
     pub max_len: usize,
     pub mean_read_length: f64,
+    pub read_nx: BTreeMap<u8, usize>,
     pub length_hist: BTreeMap<usize, u64>,
     pub gc_hist: BTreeMap<u8, u64>,
     pub mean_quality_hist: BTreeMap<u8, u64>,
@@ -89,6 +94,15 @@ pub struct FastqQcSummary {
     pub paired_reads_checked: u64,
     pub paired_name_mismatches: u64,
     pub per_base: Vec<BasePositionMetrics>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FastqLengthBin {
+    pub bin_start: usize,
+    pub bin_end: usize,
+    pub reads: u64,
+    pub bases: u64,
+    pub cumulative_bases_ge_start: u64,
 }
 
 impl FastqQcMetrics {
@@ -145,6 +159,7 @@ impl FastqQcMetrics {
             pos.count += 1;
             pos.qual_sum += phred;
             pos.bases[idx] += 1;
+            *pos.qual_hist.entry(phred as u8).or_insert(0) += 1;
         }
 
         if n_seen {
@@ -173,32 +188,40 @@ impl FastqQcMetrics {
         *self.mean_quality_hist.entry(mean_q).or_insert(0) += 1;
 
         for adapter in DEFAULT_ADAPTERS {
-            if contains_ascii(seq, adapter.as_bytes()) {
+            if let Some(found_pos) = find_substring(seq, adapter.as_bytes()) {
                 *self.adapter_hits.entry((*adapter).to_string()).or_insert(0) += 1;
+                if found_pos < self.per_base.len() {
+                    self.per_base[found_pos].adapter_hits += 1;
+                }
             }
         }
 
         if self.duplicate_sample_reads < config.sample_size as u64 {
             self.duplicate_sample_reads += 1;
-            let sequence = String::from_utf8_lossy(seq).to_string();
-            match self.overrepresented.get_mut(&sequence) {
+
+            // Use entry pattern without to_string() where possible
+            match self.overrepresented_bytes.get_mut(seq) {
                 Some(count) => *count += 1,
                 None => {
                     self.duplicate_sample_unique += 1;
-                    self.overrepresented.insert(sequence, 1);
+                    self.overrepresented_bytes.insert(seq.to_vec(), 1);
                 }
             }
 
             if !config.no_kmers && config.kmer_size > 0 && seq.len() >= config.kmer_size {
+                let mut kmer_buf = vec![0u8; config.kmer_size];
                 for kmer in seq.windows(config.kmer_size) {
-                    if kmer
-                        .iter()
-                        .all(|b| matches!(b.to_ascii_uppercase(), b'A' | b'C' | b'G' | b'T'))
-                    {
-                        *self
-                            .kmers
-                            .entry(kmer.iter().map(|b| b.to_ascii_uppercase()).collect())
-                            .or_insert(0) += 1;
+                    let mut valid = true;
+                    for (j, &b) in kmer.iter().enumerate() {
+                        let upper = b.to_ascii_uppercase();
+                        if !matches!(upper, b'A' | b'C' | b'G' | b'T') {
+                            valid = false;
+                            break;
+                        }
+                        kmer_buf[j] = upper;
+                    }
+                    if valid {
+                        *self.kmers.entry(kmer_buf.clone()).or_insert(0) += 1;
                     }
                 }
             }
@@ -223,12 +246,59 @@ impl FastqQcMetrics {
         }
     }
 
+    pub fn read_nx(&self) -> BTreeMap<u8, usize> {
+        let mut out = BTreeMap::new();
+        if self.total_bases == 0 {
+            return out;
+        }
+
+        let mut next_n = 5_u8;
+        let mut cumulative_bases = 0_u64;
+        for (&len, &count) in self.length_hist.iter().rev() {
+            cumulative_bases += len as u64 * count;
+            while next_n <= 100
+                && cumulative_bases.saturating_mul(100)
+                    >= self.total_bases.saturating_mul(next_n as u64)
+            {
+                out.insert(next_n, len);
+                next_n += 5;
+            }
+        }
+        out
+    }
+
+    pub fn length_bins(&self, bin_size: usize) -> Vec<FastqLengthBin> {
+        let bin_size = bin_size.max(1);
+        let mut bins: BTreeMap<usize, (u64, u64)> = BTreeMap::new();
+        for (&len, &count) in &self.length_hist {
+            let bin_start = (len / bin_size) * bin_size;
+            let entry = bins.entry(bin_start).or_default();
+            entry.0 += count;
+            entry.1 += count * len as u64;
+        }
+
+        let mut cumulative = 0_u64;
+        let mut out = Vec::with_capacity(bins.len());
+        for (&bin_start, &(reads, bases)) in bins.iter().rev() {
+            cumulative += bases;
+            out.push(FastqLengthBin {
+                bin_start,
+                bin_end: bin_start + bin_size,
+                reads,
+                bases,
+                cumulative_bases_ge_start: cumulative,
+            });
+        }
+        out.reverse();
+        out
+    }
+
     pub fn summary(&self) -> FastqQcSummary {
         let mut overrepresented: Vec<_> = self
-            .overrepresented
+            .overrepresented_bytes
             .iter()
             .map(|(sequence, &count)| FastqOverrepresented {
-                sequence: sequence.clone(),
+                sequence: String::from_utf8_lossy(sequence).to_string(),
                 count,
             })
             .collect();
@@ -254,10 +324,15 @@ impl FastqQcMetrics {
             min_len: self.min_len,
             max_len: self.max_len,
             mean_read_length: self.mean_read_length(),
+            read_nx: self.read_nx(),
             length_hist: self.length_hist.clone(),
             gc_hist: self.gc_hist.clone(),
             mean_quality_hist: self.mean_quality_hist.clone(),
-            adapter_hits: self.adapter_hits.clone(),
+            adapter_hits: self
+                .adapter_hits
+                .iter()
+                .map(|(k, &v)| (k.clone(), v))
+                .collect(),
             overrepresented,
             kmers,
             duplicate_sample_reads: self.duplicate_sample_reads,
@@ -407,6 +482,8 @@ fn write_outputs(config: &FastqQcConfig, metrics: &FastqQcMetrics) -> Result<()>
         "reads",
         metrics.length_hist.iter().map(|(&k, &v)| (k as u64, v)),
     )?;
+    write_length_bins(config, metrics)?;
+    write_length_plot(config, metrics)?;
     write_histogram(
         &format!("{}.fastq.gc_distribution.tsv", config.output_prefix),
         "gc_percent",
@@ -429,9 +506,9 @@ fn write_outputs(config: &FastqQcConfig, metrics: &FastqQcMetrics) -> Result<()>
         &format!("{}.fastq.overrepresented.tsv", config.output_prefix),
         "sequence",
         metrics
-            .overrepresented
+            .overrepresented_bytes
             .iter()
-            .map(|(sequence, &count)| (sequence.as_str(), count)),
+            .map(|(sequence, &count)| (std::str::from_utf8(sequence).unwrap_or("N"), count)),
         config.top_n,
     )?;
     write_ranked_sequences(
@@ -449,7 +526,55 @@ fn write_outputs(config: &FastqQcConfig, metrics: &FastqQcMetrics) -> Result<()>
         &config.output_prefix,
         &summary,
     )?;
+    write_per_base_metrics(config, metrics)?;
     Ok(())
+}
+
+fn write_per_base_metrics(config: &FastqQcConfig, metrics: &FastqQcMetrics) -> Result<()> {
+    let mut out = File::create(format!("{}.fastq.per_base.tsv", config.output_prefix))?;
+    writeln!(
+        out,
+        "pos\tcount\tA\tC\tG\tT\tN\tmean_qual\tmedian_qual\tadapter_hits"
+    )?;
+    for (i, p) in metrics.per_base.iter().enumerate() {
+        let mean_q = if p.count > 0 {
+            p.qual_sum as f64 / p.count as f64
+        } else {
+            0.0
+        };
+        let median_q = calculate_median(&p.qual_hist);
+        writeln!(
+            out,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.2}\t{}\t{}",
+            i + 1,
+            p.count,
+            p.bases[0],
+            p.bases[1],
+            p.bases[2],
+            p.bases[3],
+            p.bases[4],
+            mean_q,
+            median_q,
+            p.adapter_hits
+        )?;
+    }
+    Ok(())
+}
+
+fn calculate_median(hist: &BTreeMap<u8, u64>) -> u8 {
+    let total: u64 = hist.values().sum();
+    if total == 0 {
+        return 0;
+    }
+    let mut seen = 0;
+    let target = total / 2;
+    for (&q, &c) in hist {
+        seen += c;
+        if seen >= target {
+            return q;
+        }
+    }
+    0
 }
 
 fn write_summary(config: &FastqQcConfig, metrics: &FastqQcMetrics) -> Result<()> {
@@ -459,6 +584,9 @@ fn write_summary(config: &FastqQcConfig, metrics: &FastqQcMetrics) -> Result<()>
     writeln!(out, "min_read_length\t{}", metrics.min_len)?;
     writeln!(out, "mean_read_length\t{:.2}", metrics.mean_read_length())?;
     writeln!(out, "max_read_length\t{}", metrics.max_len)?;
+    for (n, len) in metrics.read_nx() {
+        writeln!(out, "read_n{n}\t{len}")?;
+    }
     writeln!(
         out,
         "duplication_estimate\t{:.6}",
@@ -485,6 +613,49 @@ fn write_summary(config: &FastqQcConfig, metrics: &FastqQcMetrics) -> Result<()>
     for (adapter, count) in &metrics.adapter_hits {
         writeln!(out, "adapter_hit:{adapter}\t{count}")?;
     }
+    Ok(())
+}
+
+fn write_length_bins(config: &FastqQcConfig, metrics: &FastqQcMetrics) -> Result<()> {
+    let mut out = File::create(format!("{}.fastq.length_bins.tsv", config.output_prefix))?;
+    writeln!(
+        out,
+        "bin_start\tbin_end\treads\tbases\tcumulative_bases_ge_start"
+    )?;
+    for bin in metrics.length_bins(config.length_bin_size) {
+        writeln!(
+            out,
+            "{}\t{}\t{}\t{}\t{}",
+            bin.bin_start, bin.bin_end, bin.reads, bin.bases, bin.cumulative_bases_ge_start
+        )?;
+    }
+    Ok(())
+}
+
+fn write_length_plot(config: &FastqQcConfig, metrics: &FastqQcMetrics) -> Result<()> {
+    let bins = metrics.length_bins(config.length_bin_size);
+    if bins.is_empty() {
+        return Ok(());
+    }
+
+    let data: Vec<(f64, f64)> = bins
+        .iter()
+        .map(|bin| (bin.bin_start as f64, bin.reads as f64))
+        .collect();
+    let line = LinePlot::new()
+        .with_data(data)
+        .with_legend("reads".to_string())
+        .with_line_style(LineStyle::Solid);
+    let plots = vec![line.into()];
+    let layout = Layout::auto_from_plots(&plots)
+        .with_title("FASTQ Read Length Distribution")
+        .with_x_label("Read length bin start (bp)")
+        .with_y_label("Reads");
+    let svg = render_to_svg(plots, layout);
+    std::fs::write(
+        format!("{}.fastq.length_distribution.svg", config.output_prefix),
+        svg,
+    )?;
     Ok(())
 }
 
@@ -553,10 +724,17 @@ fn pct(n: u64, total: u64) -> f64 {
     }
 }
 
-fn contains_ascii(haystack: &[u8], needle: &[u8]) -> bool {
+fn find_substring(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
     haystack
         .windows(needle.len())
-        .any(|window| window.eq_ignore_ascii_case(needle))
+        .position(|window| window.eq_ignore_ascii_case(needle))
+}
+
+fn contains_ascii(haystack: &[u8], needle: &[u8]) -> bool {
+    find_substring(haystack, needle).is_some()
 }
 
 fn has_poly_tail(seq: &[u8], base: u8, min_run: usize) -> bool {
@@ -609,6 +787,7 @@ mod tests {
             phred_offset: 33,
             no_kmers: false,
             paired: false,
+            length_bin_size: 1000,
         };
         let mut metrics = FastqQcMetrics::default();
         metrics.observe(b"ACGTNN", b"IIIIII", &config).unwrap();
@@ -622,5 +801,24 @@ mod tests {
         assert_eq!(metrics.per_base[1].bases[1], 2);
         assert_eq!(metrics.mean_quality_hist.get(&40), Some(&1));
         assert_eq!(metrics.mean_quality_hist.get(&0), Some(&1));
+    }
+
+    #[test]
+    fn computes_long_read_nx_and_length_bins() {
+        let mut metrics = FastqQcMetrics::default();
+        for len in [100_usize, 200, 700, 1000] {
+            metrics.total_reads += 1;
+            metrics.total_bases += len as u64;
+            *metrics.length_hist.entry(len).or_insert(0) += 1;
+        }
+
+        assert_eq!(metrics.read_nx().get(&50), Some(&1000));
+        assert_eq!(metrics.read_nx().get(&75), Some(&700));
+        let bins = metrics.length_bins(500);
+        assert_eq!(bins.len(), 3);
+        assert_eq!(bins[0].bin_start, 0);
+        assert_eq!(bins[0].reads, 2);
+        assert_eq!(bins[2].bin_start, 1000);
+        assert_eq!(bins[2].cumulative_bases_ge_start, 1000);
     }
 }

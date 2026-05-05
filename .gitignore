@@ -3,4 +3,7 @@
 /tests/
 /target/
 /scratch/
-
+*.snap.png
+*.snap.svg
+*.report.html
+*.summary.json
