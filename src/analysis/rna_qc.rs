@@ -1,5 +1,6 @@
 mod config;
 mod report;
+mod scan;
 mod state;
 
 use crate::analysis::alignment_qc::sample_name_from_alignment_path;
@@ -11,7 +12,7 @@ use crate::analysis::qc::{InlineQcState, ReadEndType};
 use crate::analysis::types::AnalysisType;
 use crate::io::annotation::{load_annotation, load_genes, AnnotationConfig, AnnotationFormat};
 use crate::io::bam::{alignment_start_0, for_each_aligned_block, match_span, reference_span};
-use crate::models::{is_autosomal_chrom, normalize_chrom, Gene};
+use crate::models::{normalize_chrom, Gene};
 use crate::stats::plotting::PlotMetadata;
 use crate::stats::{aggregate_genes, ThreePrimeParams};
 use anyhow::{bail, Result};
@@ -820,36 +821,27 @@ pub fn run_rna(config: RnaQcConfig) -> Result<()> {
 }
 
 fn normalized_name_set(names: &[String]) -> HashSet<String> {
-    names
-        .iter()
-        .map(|n| normalize_chrom(n).into_owned())
-        .collect()
+    scan::normalized_name_set(names)
 }
 
 fn autosomal_coverage_index(index: &AnnotationIndex) -> AnnotationIndex {
-    let genes = index
-        .genes
-        .iter()
-        .filter(|gene| is_autosomal_chrom(&gene.chrom))
-        .cloned()
-        .collect();
-    AnnotationIndex::new(genes, false)
+    scan::autosomal_coverage_index(index)
 }
 
 fn normalize_thread_count(threads: usize) -> usize {
-    threads.max(1)
+    scan::normalize_thread_count(threads)
 }
 
 fn window_owns_record_start(pos: u64, win_start: u64, win_end: u64) -> bool {
-    pos >= win_start && pos < win_end
+    scan::window_owns_record_start(pos, win_start, win_end)
 }
 
 fn is_mtdna_chrom_norm(chrom: &str) -> bool {
-    chrom == "m" || chrom == "mt" || chrom == "chrm" || chrom == "chrmt"
+    scan::is_mtdna_chrom_norm(chrom)
 }
 
 fn is_rdna_chrom_norm(chrom: &str, rdna_contigs: &HashSet<String>) -> bool {
-    rdna_contigs.contains(chrom)
+    scan::is_rdna_chrom_norm(chrom, rdna_contigs)
 }
 
 fn scan_inline_qc_sample(
