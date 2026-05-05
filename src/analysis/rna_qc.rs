@@ -1,3 +1,6 @@
+mod config;
+mod state;
+
 use crate::analysis::alignment_qc::sample_name_from_alignment_path;
 use crate::analysis::bam_scan::{find_bai_path, generate_windows};
 use crate::analysis::contamination::ContaminantIndex;
@@ -5,9 +8,7 @@ use crate::analysis::feature_index::FeatureIndex;
 use crate::analysis::index::{AnnotationIndex, DenseMap};
 use crate::analysis::qc::{InlineQcState, ReadEndType};
 use crate::analysis::types::AnalysisType;
-use crate::io::annotation::{
-    load_annotation, load_genes, AnnotationConfig, AnnotationFormat, IsoformSelect,
-};
+use crate::io::annotation::{load_annotation, load_genes, AnnotationConfig, AnnotationFormat};
 use crate::io::bam::{alignment_start_0, for_each_aligned_block, match_span, reference_span};
 use crate::models::{is_autosomal_chrom, normalize_chrom, Gene};
 use crate::stats::plotting::{
@@ -33,176 +34,8 @@ thread_local! {
 }
 
 const MAX_REASONABLE_INNER_DISTANCE_BP: i64 = 2_000;
-
-#[derive(Clone, Debug, Default)]
-pub struct RnaQcConfig {
-    pub input: Vec<String>,
-    pub annotation: String,
-    pub annotation_format: String,
-    pub output: String,
-    pub threads: usize,
-    pub analysis: Vec<AnalysisType>,
-    pub three_prime_cluster_window: u64,
-    pub min_length: u64,
-    pub normalization_bp: usize,
-    pub gene_id_delimiter: Option<char>,
-    pub gene_id_regex: Option<String>,
-    pub mapq: u8,
-    pub max_3p_dist: usize,
-    pub min_support: usize,
-    pub no_plot: bool,
-    pub r2_only: bool,
-    pub biotype: String,
-    pub save_index: bool,
-    pub load_index: bool,
-    pub ends: bool,
-    pub transcript_centric: bool,
-    pub plus: bool,
-    pub isoform_select: IsoformSelect,
-    pub coverage_weighted: bool,
-    pub strict_cluster: bool,
-    pub stratify_length: bool,
-    pub qc_sample_size: usize,
-    pub rdna_bed: Option<String>,
-    pub rdna_contigs: Vec<String>,
-    pub step_size: usize,
-    pub three_prime_bin_size: usize,
-    pub three_prime_min_anchor_count: u64,
-    pub three_prime_min_anchor_mean: f64,
-    pub three_prime_min_anchor_nonzero_bins: usize,
-    pub three_prime_max_ratio: f64,
-    pub write_counts: bool,
-}
-
-#[derive(Debug, Clone)]
-struct RnaWorkerState {
-    records_seen: u64,
-    fail_unmapped: u64,
-    fail_secondary: u64,
-    fail_qc: u64,
-    fail_mapq: u64,
-    overlaps_found: u64,
-    total_tags: u64,
-    aligned_qc_reads: u64,
-    mtdna_reads: u64,
-    rdna_reads: u64,
-    read_dist_counts: [u64; 12],
-    qc: InlineQcState,
-}
-
-impl RnaWorkerState {
-    fn new_with_capacity(_n_genes: usize, _max_3p_dist: usize, qc_sample_size: usize) -> Self {
-        Self {
-            records_seen: 0,
-            fail_unmapped: 0,
-            fail_secondary: 0,
-            fail_qc: 0,
-            fail_mapq: 0,
-            overlaps_found: 0,
-            total_tags: 0,
-            aligned_qc_reads: 0,
-            mtdna_reads: 0,
-            rdna_reads: 0,
-            read_dist_counts: [0; 12],
-            qc: InlineQcState::new(qc_sample_size),
-        }
-    }
-
-    fn merge(mut self, other: Self) -> Self {
-        self.records_seen += other.records_seen;
-        self.fail_unmapped += other.fail_unmapped;
-        self.fail_secondary += other.fail_secondary;
-        self.fail_qc += other.fail_qc;
-        self.fail_mapq += other.fail_mapq;
-        self.overlaps_found += other.overlaps_found;
-        self.total_tags += other.total_tags;
-        self.aligned_qc_reads += other.aligned_qc_reads;
-        self.mtdna_reads += other.mtdna_reads;
-        self.rdna_reads += other.rdna_reads;
-
-        for i in 0..12 {
-            self.read_dist_counts[i] += other.read_dist_counts[i];
-        }
-
-        self.qc.merge_from(other.qc);
-        self
-    }
-
-    fn write_read_distribution_report(
-        &self,
-        path: &str,
-        feature_index: &FeatureIndex,
-    ) -> Result<()> {
-        let mut f_dist = File::create(path)?;
-        use crate::analysis::read_distribution::RegionType;
-        use std::io::Write;
-
-        let total_assigned: u64 = (0..12)
-            .filter(|&i| i != RegionType::Intergenic as usize)
-            .map(|i| self.read_dist_counts[i])
-            .sum();
-
-        let passed_filters = self.records_seen
-            - self.fail_unmapped
-            - self.fail_secondary
-            - self.fail_qc
-            - self.fail_mapq;
-
-        writeln!(f_dist, "{:<30}{}", "Total Reads", passed_filters)?;
-        writeln!(f_dist, "{:<30}{}", "Total Tags", self.total_tags)?;
-        writeln!(f_dist, "{:<30}{}", "Total Assigned Tags", total_assigned)?;
-        writeln!(
-            f_dist,
-            "====================================================================="
-        )?;
-        writeln!(
-            f_dist,
-            "{:<20}{:<20}{:<20}{:<20}",
-            "Group", "Total_bases", "Tag_count", "Tags/Kb"
-        )?;
-
-        let groups = [
-            RegionType::CdsExon,
-            RegionType::Utr5Exon,
-            RegionType::Utr3Exon,
-            RegionType::Exon,
-            RegionType::Intron,
-            RegionType::TssUp1kb,
-            RegionType::TssUp5kb,
-            RegionType::TssUp10kb,
-            RegionType::TesDown1kb,
-            RegionType::TesDown5kb,
-            RegionType::TesDown10kb,
-        ];
-
-        for group in groups {
-            let size = feature_index
-                .feature_sizes
-                .get(&group)
-                .cloned()
-                .unwrap_or(0);
-            let count = self.read_dist_counts[group as usize];
-            let tags_per_kb = if size > 0 {
-                (count as f64 * 1000.0) / (size as f64)
-            } else {
-                0.0
-            };
-            writeln!(
-                f_dist,
-                "{:<20}{:<20}{:<20}{:<18.2}",
-                group.to_string(),
-                size,
-                count,
-                tags_per_kb
-            )?;
-        }
-        writeln!(
-            f_dist,
-            "====================================================================="
-        )?;
-        Ok(())
-    }
-}
+pub use config::RnaQcConfig;
+use state::RnaWorkerState;
 
 pub fn run_rna(config: RnaQcConfig) -> Result<()> {
     let threads = normalize_thread_count(config.threads);
@@ -957,7 +790,10 @@ pub fn run_rna(config: RnaQcConfig) -> Result<()> {
             dist_3p_all.insert(sample_name.to_string(), stats.dist_3p_means.clone());
             dist_3p_support_all.insert(sample_name.to_string(), stats.dist_3p_support.clone());
             dist_3p_raw_all.insert(sample_name.to_string(), stats.dist_3p_sums_raw_all.clone());
-            dist_3p_raw_analyzed_all.insert(sample_name.to_string(), stats.dist_3p_sums_raw_analyzed.clone());
+            dist_3p_raw_analyzed_all.insert(
+                sample_name.to_string(),
+                stats.dist_3p_sums_raw_analyzed.clone(),
+            );
             plot_metadata_all.insert(
                 sample_name.to_string(),
                 PlotMetadata {
@@ -1043,7 +879,10 @@ pub fn run_rna(config: RnaQcConfig) -> Result<()> {
             config.three_prime_bin_size,
             config.max_3p_dist,
         )?;
-        println!("3' raw analyzed profile written to: {}", dist_3p_raw_analyzed_path);
+        println!(
+            "3' raw analyzed profile written to: {}",
+            dist_3p_raw_analyzed_path
+        );
 
         let dist_3p_raw_all_path = format!("{}.3p_raw_all.tsv", config.output);
         write_3p_wide_tsv(
