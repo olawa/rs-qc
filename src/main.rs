@@ -12,7 +12,8 @@ use crate::analysis::fastq_qc::{run_fastq_qc, sample_name_from_path, FastqQcConf
 use crate::analysis::report::{build_document, resolve_input_files, write_report};
 use crate::analysis::rna_qc::{run_rna, RnaQcConfig};
 use crate::analysis::snapshot::{
-    parse_region, run_snapshot, validate_output_format, SnapshotConfig, SnapshotOutputFormat,
+    resolve_snapshot_region, run_snapshot, validate_output_format, SnapshotConfig,
+    SnapshotOutputFormat,
 };
 use crate::analysis::types::AnalysisType;
 use crate::io::annotation::AnnotationFormat;
@@ -136,6 +137,15 @@ pub enum SnapFormat {
     Svg,
 }
 
+#[derive(ValueEnum, Clone, Debug, PartialEq, Eq, Default)]
+pub enum SnapBaseTrackMode {
+    #[default]
+    Top,
+    Bottom,
+    Both,
+    None,
+}
+
 #[derive(ClapArgs, Debug)]
 struct SnapArgs {
     #[arg(short = 'i', long = "bam")]
@@ -156,8 +166,6 @@ struct SnapArgs {
     mapq: u8,
     #[arg(long, default_value_t = 500)]
     max_reads: usize,
-    #[arg(long, default_value_t = false)]
-    sample_reads: bool,
     #[arg(long, default_value_t = 1400)]
     width: u32,
     #[arg(long, default_value_t = 500)]
@@ -166,6 +174,11 @@ struct SnapArgs {
     no_reference: bool,
     #[arg(long, default_value_t = false)]
     no_genes: bool,
+    #[arg(long, default_value_t = false)]
+    squash: bool,
+    /// Where to draw colored base tracks: top reference strip, bottom sample strip, both, or none.
+    #[arg(long, value_enum, default_value = "top")]
+    base_track: SnapBaseTrackMode,
     #[arg(long, value_enum, default_value = "auto")]
     format: SnapFormat,
 }
@@ -589,7 +602,15 @@ fn run_report(args: ReportArgs) -> Result<()> {
 }
 
 fn run_snap(args: SnapArgs) -> Result<()> {
-    let region = parse_region(&args.region)?;
+    let region = resolve_snapshot_region(
+        &args.region,
+        args.annotation.as_deref(),
+        match args.annotation_format {
+            SnapAnnotationFormat::Auto => AnnotationFormat::Auto,
+            SnapAnnotationFormat::Gtf => AnnotationFormat::Gtf,
+            SnapAnnotationFormat::Bed12 => AnnotationFormat::Bed12,
+        },
+    )?;
     validate_output_format(
         &args.output,
         match args.format {
@@ -609,6 +630,13 @@ fn run_snap(args: SnapArgs) -> Result<()> {
         region.end
     );
 
+    let (show_reference_base_track, show_sample_base_track) = match args.base_track {
+        SnapBaseTrackMode::Top => (true, false),
+        SnapBaseTrackMode::Bottom => (false, true),
+        SnapBaseTrackMode::Both => (true, true),
+        SnapBaseTrackMode::None => (false, false),
+    };
+
     let config = SnapshotConfig {
         bam_path: args.bam,
         bai_path: args.bai,
@@ -623,11 +651,13 @@ fn run_snap(args: SnapArgs) -> Result<()> {
         output_path: args.output.clone(),
         mapq_threshold: args.mapq,
         max_reads: args.max_reads,
-        sample_reads: args.sample_reads,
         width: args.width,
         min_height: args.min_height,
         show_reference: !args.no_reference,
         show_genes: !args.no_genes,
+        show_reference_base_track,
+        show_sample_base_track,
+        squash: args.squash,
     };
 
     run_snapshot(&config)?;

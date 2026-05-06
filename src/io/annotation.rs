@@ -1,10 +1,9 @@
 use crate::models::{Exon, Gene, Transcript};
+use crate::io::text::open_maybe_gz;
 use anyhow::{anyhow, Context, Result};
-use flate2::read::GzDecoder;
 use regex::Regex;
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::BufRead;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IdResolutionStrategy {
@@ -103,15 +102,8 @@ pub fn load_annotation(
     format: AnnotationFormat,
     config: &AnnotationConfig,
 ) -> Result<LoadedAnnotation> {
-    let file =
-        File::open(path).with_context(|| format!("Failed to open annotation file: {}", path))?;
-
-    // Transparently handle gzip compression
-    let reader: Box<dyn BufRead> = if path.ends_with(".gz") {
-        Box::new(BufReader::new(GzDecoder::new(file)))
-    } else {
-        Box::new(BufReader::new(file))
-    };
+    let reader = open_maybe_gz(path)
+        .with_context(|| format!("Failed to open annotation file: {}", path))?;
 
     let resolved_format = match format {
         AnnotationFormat::Auto => {
@@ -492,6 +484,8 @@ fn parse_gtf_attributes(attr: &str) -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
+    use std::io::BufReader;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -622,6 +616,54 @@ chr1	custom	exon	101	200	.	+	.	gene_id "G1"; transcript_id "T1";
         let genes = load_genes(&gz_path, AnnotationFormat::Auto, &config).unwrap();
         assert_eq!(genes.len(), 1);
         assert_eq!(genes[0].id, "G1");
+
+        std::fs::remove_file(gz_path).unwrap();
+    }
+
+    #[test]
+    fn test_multi_member_gzip_loading() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        fn gzip_member(content: &str) -> Vec<u8> {
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(content.as_bytes()).unwrap();
+            encoder.finish().unwrap()
+        }
+
+        let member1 = gzip_member(
+            r#"chr1	custom	exon	101	200	.	+	.	gene_id "G1"; transcript_id "T1";
+"#,
+        );
+        let member2 = gzip_member(
+            r#"chr1	custom	exon	301	400	.	+	.	gene_id "G1"; transcript_id "T1";
+"#,
+        );
+
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(&member1).unwrap();
+        file.write_all(&member2).unwrap();
+        let path = file.path().to_str().unwrap();
+        let gz_path = format!("{}.gtf.gz", path);
+        std::fs::copy(path, &gz_path).unwrap();
+
+        let config = AnnotationConfig {
+            gene_id_delimiter: None,
+            gene_id_regex: None,
+            biotype_filter: None,
+            three_prime_cluster_window: 50,
+            min_transcript_length: 100,
+            max_3p_dist: 15000,
+            three_prime_bin_size: 50,
+            transcript_centric: false,
+            plus_strand_only: false,
+            isoform_select: IsoformSelect::Longest,
+            strict_cluster: false,
+        };
+
+        let loaded = load_annotation(&gz_path, AnnotationFormat::Auto, &config).unwrap();
+        assert_eq!(loaded.transcripts.len(), 1);
+        assert_eq!(loaded.transcripts[0].exons.len(), 2);
 
         std::fs::remove_file(gz_path).unwrap();
     }

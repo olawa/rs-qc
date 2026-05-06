@@ -299,11 +299,9 @@ impl InlineQcState {
                 let op = result.expect("Invalid CIGAR op");
                 use noodles::sam::alignment::record::cigar::op::Kind;
                 match op.kind() {
-                    Kind::Match
-                    | Kind::Deletion
-                    | Kind::Insertion
-                    | Kind::SequenceMatch
-                    | Kind::SequenceMismatch => op.len() as u64,
+                    Kind::Match | Kind::Deletion | Kind::SequenceMatch | Kind::SequenceMismatch => {
+                        op.len() as u64
+                    }
                     _ => 0,
                 }
             })

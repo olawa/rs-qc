@@ -1,22 +1,23 @@
 use crate::analysis::bam_scan::find_bai_path;
 use crate::io::annotation::AnnotationFormat;
+use crate::io::text::open_maybe_gz;
 use anyhow::{anyhow, bail, Context, Result};
-use flate2::read::MultiGzDecoder;
 use noodles::sam::alignment::record::cigar::op::Kind;
 use noodles::sam::alignment::record::data::field::{Tag, Value};
 use noodles::{bam, fasta, sam};
+use regex::Regex;
 use region_plot::{
     render_to_path, BasePileup, CoveragePoint, GeneModel, PlotOptions, ReadModel, ReadSegment,
     RegionPlot, SamplePlotData,
 };
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::BufRead;
 use std::path::Path;
 
 const DEFAULT_SINGLE_POS_FLANK_BP: u64 = 500;
-const MAX_REGION_BP: u64 = 50_000;
-const REFERENCE_DISPLAY_MAX_BP: u64 = 2_000;
+const MAX_REGION_BP: u64 = 1_000_000;
+const REFERENCE_DISPLAY_MAX_BP: u64 = 1_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenomicRegion {
@@ -48,11 +49,13 @@ pub struct SnapshotConfig {
     pub output_path: String,
     pub mapq_threshold: u8,
     pub max_reads: usize,
-    pub sample_reads: bool,
     pub width: u32,
     pub min_height: u32,
     pub show_reference: bool,
     pub show_genes: bool,
+    pub show_reference_base_track: bool,
+    pub show_sample_base_track: bool,
+    pub squash: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +70,10 @@ pub fn run_snapshot(config: &SnapshotConfig) -> Result<()> {
     let opts = PlotOptions {
         width: config.width,
         min_height: config.min_height,
+        font_family: "sans-serif".to_string(),
+        squash: config.squash,
+        show_reference_base_track: config.show_reference_base_track,
+        show_sample_base_track: config.show_sample_base_track,
         ..PlotOptions::default()
     };
     render_to_path(&plot, &opts, &config.output_path)
@@ -118,6 +125,24 @@ pub fn build_region_plot(config: &SnapshotConfig) -> Result<RegionPlot> {
     })
 }
 
+pub fn resolve_snapshot_region(
+    raw_region: &str,
+    annotation_path: Option<&str>,
+    annotation_format: AnnotationFormat,
+) -> Result<GenomicRegion> {
+    if let Ok(region) = parse_region(raw_region) {
+        return Ok(region);
+    }
+
+    let Some(path) = annotation_path else {
+        bail!("region must look like chr:start-end or a gene name when --annotation is provided");
+    };
+
+    lookup_gene_region(path, raw_region, annotation_format)
+        .map(pad_gene_region)
+        .ok_or_else(|| anyhow!("invalid region or gene not found: {raw_region}"))
+}
+
 pub fn parse_region(raw: &str) -> Result<GenomicRegion> {
     let (chrom, rest) = raw
         .split_once(':')
@@ -158,6 +183,87 @@ pub fn parse_region(raw: &str) -> Result<GenomicRegion> {
     }
 }
 
+fn pad_gene_region((chrom, start, end): (String, i64, i64)) -> GenomicRegion {
+    let span = (end - start).abs().max(1);
+    let padding = (span / 8).clamp(200, 5_000);
+    GenomicRegion {
+        chrom,
+        start: (start - padding).max(1) as u64,
+        end: (end + padding) as u64,
+    }
+}
+
+fn lookup_gene_region(
+    path: &str,
+    gene_name: &str,
+    annotation_format: AnnotationFormat,
+) -> Option<(String, i64, i64)> {
+    let gene_name_lower = gene_name.trim().to_lowercase();
+    if gene_name_lower.is_empty() {
+        return None;
+    }
+
+    match annotation_format {
+        AnnotationFormat::Auto => {
+            if path.ends_with(".gtf") || path.ends_with(".gtf.gz") {
+                lookup_gtf_gene_region(path, &gene_name_lower)
+                    .or_else(|| lookup_bed_gene_region(path, &gene_name_lower))
+            } else {
+                lookup_bed_gene_region(path, &gene_name_lower)
+                    .or_else(|| lookup_gtf_gene_region(path, &gene_name_lower))
+            }
+        }
+        AnnotationFormat::Gtf => lookup_gtf_gene_region(path, &gene_name_lower),
+        AnnotationFormat::Bed12 => lookup_bed_gene_region(path, &gene_name_lower),
+    }
+}
+
+fn lookup_gtf_gene_region(path: &str, gene_name_lower: &str) -> Option<(String, i64, i64)> {
+    let reader = open_maybe_gz(path).ok()?;
+    let gene_re = Regex::new(r#"gene_name "([^"]+)""#).ok()?;
+    for line in reader.lines() {
+        let line = line.ok()?;
+        if line.starts_with('#') {
+            continue;
+        }
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() < 9 || parts[2] != "gene" {
+            continue;
+        }
+        let caps = gene_re.captures(parts[8])?;
+        let name = caps.get(1)?.as_str();
+        if name.to_lowercase() != gene_name_lower {
+            continue;
+        }
+        let start = parts[3].parse::<i64>().ok()?;
+        let end = parts[4].parse::<i64>().ok()?;
+        return Some((parts[0].to_string(), start, end));
+    }
+    None
+}
+
+fn lookup_bed_gene_region(path: &str, gene_name_lower: &str) -> Option<(String, i64, i64)> {
+    let reader = open_maybe_gz(path).ok()?;
+    for line in reader.lines() {
+        let line = line.ok()?;
+        if line.starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        let name = parts.get(3).copied().unwrap_or("").trim().to_lowercase();
+        if name != gene_name_lower {
+            continue;
+        }
+        let start = parts[1].parse::<i64>().ok()?;
+        let end = parts[2].parse::<i64>().ok()?;
+        return Some((parts[0].to_string(), start, end));
+    }
+    None
+}
+
 pub fn validate_output_format(path: &str, format: SnapshotOutputFormat) -> Result<()> {
     match format {
         SnapshotOutputFormat::Auto => match Path::new(path).extension().and_then(|e| e.to_str()) {
@@ -195,7 +301,18 @@ fn extract_bam_snapshot(
         .set_index(bai)
         .build_from_reader(file)?;
     let header = reader.read_header()?;
-    let query_region: noodles::core::Region = config.region.to_query_string().parse()?;
+    let fetch_chrom = chrom_aliases(&config.region.chrom)
+        .into_iter()
+        .find(|alias| header.reference_sequences().get(alias.as_bytes()).is_some())
+        .ok_or_else(|| anyhow!("chromosome {} not found in BAM header", config.region.chrom))?;
+
+    let region_str = format!(
+        "{}:{}-{}",
+        fetch_chrom,
+        config.region.start + 1,
+        config.region.end
+    );
+    let query_region: noodles::core::Region = region_str.parse()?;
     let query = reader.query(&header, &query_region)?;
 
     let mut displayed_reads = Vec::new();
@@ -215,7 +332,7 @@ fn extract_bam_snapshot(
             seen += 1;
             if displayed_reads.len() < config.max_reads {
                 displayed_reads.push(read);
-            } else if config.sample_reads && config.max_reads > 0 {
+            } else if config.max_reads > 0 {
                 rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
                 let idx = (rng as usize) % seen;
                 if idx < config.max_reads {
@@ -395,7 +512,17 @@ where
                 ref_pos = op_end;
             }
             SnapshotCigarKind::Skip => {
-                ref_pos += op.len as u64;
+                let op_start = ref_pos;
+                let op_end = ref_pos + op.len as u64;
+                let clip_start = op_start.max(region.start);
+                let clip_end = op_end.min(region.end);
+                if clip_end > clip_start {
+                    segments.push(ReadSegment::Skip {
+                        ref_start: clip_start as i64,
+                        len: (clip_end - clip_start) as i64,
+                    });
+                }
+                ref_pos = op_end;
             }
             SnapshotCigarKind::SoftClip => {
                 if region.start <= ref_pos && ref_pos <= region.end {
@@ -717,35 +844,71 @@ fn load_reference(config: &SnapshotConfig) -> Result<Option<Vec<u8>>> {
     let mut reader = fasta::io::indexed_reader::Builder::default()
         .build_from_path(path)
         .with_context(|| format!("could not open indexed FASTA {path}"))?;
-    let region: noodles::core::Region = config.region.to_query_string().parse()?;
-    let record = reader.query(&region)?;
-    Ok(Some(record.sequence().as_ref().to_vec()))
+
+    let mut sequence = None;
+    for alias in chrom_aliases(&config.region.chrom) {
+        let region_str = format!(
+            "{}:{}-{}",
+            alias,
+            config.region.start + 1,
+            config.region.end
+        );
+        if let Ok(region) = region_str.parse() {
+            if let Ok(rec) = reader.query(&region) {
+                sequence = Some(rec.sequence().as_ref().to_vec());
+                break;
+            }
+        }
+    }
+
+    Ok(sequence)
 }
 
 fn load_genes(config: &SnapshotConfig) -> Result<Vec<GeneModel>> {
     let Some(path) = &config.annotation_path else {
         return Ok(Vec::new());
     };
-    match config.annotation_format {
-        AnnotationFormat::Auto => {
-            if path.ends_with(".gtf") || path.ends_with(".gtf.gz") {
-                load_gtf_genes(path, &config.region)
-            } else {
-                load_bed12_genes(path, &config.region)
+    let mut genes = Vec::new();
+    for alias in chrom_aliases(&config.region.chrom) {
+        let mut local_region = config.region.clone();
+        local_region.chrom = alias;
+        match config.annotation_format {
+            AnnotationFormat::Auto => {
+                if path.ends_with(".gtf") || path.ends_with(".gtf.gz") {
+                    if let Ok(g) = load_gtf_genes(path, &local_region) {
+                        if !g.is_empty() {
+                            genes = g;
+                            break;
+                        }
+                    }
+                } else {
+                    if let Ok(g) = load_bed12_genes(path, &local_region) {
+                        if !g.is_empty() {
+                            genes = g;
+                            break;
+                        }
+                    }
+                }
+            }
+            AnnotationFormat::Gtf => {
+                if let Ok(g) = load_gtf_genes(path, &local_region) {
+                    if !g.is_empty() {
+                        genes = g;
+                        break;
+                    }
+                }
+            }
+            AnnotationFormat::Bed12 => {
+                if let Ok(g) = load_bed12_genes(path, &local_region) {
+                    if !g.is_empty() {
+                        genes = g;
+                        break;
+                    }
+                }
             }
         }
-        AnnotationFormat::Gtf => load_gtf_genes(path, &config.region),
-        AnnotationFormat::Bed12 => load_bed12_genes(path, &config.region),
     }
-}
-
-fn open_maybe_gz(path: &str) -> Result<Box<dyn BufRead>> {
-    let file = File::open(path).with_context(|| format!("could not open annotation {path}"))?;
-    if path.ends_with(".gz") {
-        Ok(Box::new(BufReader::new(MultiGzDecoder::new(file))))
-    } else {
-        Ok(Box::new(BufReader::new(file)))
-    }
+    Ok(genes)
 }
 
 #[derive(Debug, Default)]
@@ -768,7 +931,7 @@ fn load_gtf_genes(path: &str, region: &GenomicRegion) -> Result<Vec<GeneModel>> 
             continue;
         }
         let fields: Vec<&str> = line.split('\t').collect();
-        if fields.len() != 9 || fields[2] != "exon" || fields[0] != region.chrom {
+        if fields.len() != 9 || fields[2] != "exon" || !chrom_match(fields[0], &region.chrom) {
             continue;
         }
         let start = fields[3].parse::<u64>()?.saturating_sub(1);
@@ -782,8 +945,14 @@ fn load_gtf_genes(path: &str, region: &GenomicRegion) -> Result<Vec<GeneModel>> 
             .or_else(|| attrs.get("gene_id"))
             .cloned()
             .unwrap_or_else(|| "gene".to_string());
+        let transcript_id = attrs
+            .get("transcript_id")
+            .or_else(|| attrs.get("gene_id"))
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string());
+
         let entry = genes
-            .entry(gene_name.clone())
+            .entry(transcript_id.clone())
             .or_insert_with(|| GeneBuilder {
                 name: gene_name.clone(),
                 chrom: fields[0].to_string(),
@@ -794,9 +963,7 @@ fn load_gtf_genes(path: &str, region: &GenomicRegion) -> Result<Vec<GeneModel>> 
             });
         entry.start = entry.start.min(start);
         entry.end = entry.end.max(end);
-        entry
-            .exons
-            .push((start.max(region.start), end.min(region.end)));
+        entry.exons.push((start, end));
     }
 
     Ok(build_gene_models(genes, region))
@@ -827,7 +994,7 @@ fn load_bed12_genes(path: &str, region: &GenomicRegion) -> Result<Vec<GeneModel>
             continue;
         }
         let fields: Vec<&str> = line.split('\t').collect();
-        if fields.len() < 3 || fields[0] != region.chrom {
+        if fields.len() < 3 || !chrom_match(fields[0], &region.chrom) {
             continue;
         }
         let chrom_start: u64 = fields[1].parse()?;
@@ -881,7 +1048,9 @@ fn build_gene_models(
 ) -> Vec<GeneModel> {
     let mut out: Vec<_> = genes
         .into_values()
-        .filter(|g| g.chrom == region.chrom && g.end > region.start && g.start < region.end)
+        .filter(|g| {
+            chrom_match(&g.chrom, &region.chrom) && g.end > region.start && g.start < region.end
+        })
         .map(|mut g| {
             g.exons.sort_unstable();
             g.exons.dedup();
@@ -1043,7 +1212,10 @@ mod tests {
             },
             None,
         );
-        assert_eq!(skipped.len(), 2);
+        assert_eq!(skipped.len(), 3);
+        assert!(skipped
+            .iter()
+            .any(|segment| matches!(segment, ReadSegment::Skip { .. })));
     }
 
     #[test]
@@ -1195,4 +1367,44 @@ mod tests {
         let svg = std::fs::read_to_string(path).unwrap();
         assert!(svg.contains("<svg"));
     }
+}
+fn chrom_match(c1: &str, c2: &str) -> bool {
+    normalize_chrom(c1) == normalize_chrom(c2)
+}
+
+fn normalize_chrom(c: &str) -> &str {
+    c.strip_prefix("chr").unwrap_or(c)
+}
+
+pub(crate) fn chrom_aliases(chrom: &str) -> Vec<String> {
+    let trimmed = chrom.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    let no_chr = lower.strip_prefix("chr").unwrap_or(&lower);
+    let canonical_with_chr = format!("chr{}", no_chr);
+    let canonical_without_chr = no_chr.to_string();
+    let upper_tail = lower
+        .strip_prefix("chr")
+        .unwrap_or(&lower)
+        .to_ascii_uppercase();
+
+    let mut aliases = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for alias in [
+        trimmed.to_string(),
+        trimmed.to_ascii_uppercase(),
+        canonical_with_chr,
+        canonical_without_chr,
+        lower.clone(),
+        upper_tail,
+    ] {
+        if seen.insert(alias.clone()) {
+            aliases.push(alias);
+        }
+    }
+
+    aliases
 }

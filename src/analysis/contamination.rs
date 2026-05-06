@@ -1,4 +1,5 @@
 use crate::io::bam::{reference_span, ReferenceNames};
+use crate::io::text::open_maybe_gz;
 use crate::models::normalize_chrom;
 use crate::stats::fraction;
 use anyhow::{Context, Result};
@@ -423,17 +424,6 @@ fn reverse_complement(seq: &[u8]) -> Vec<u8> {
             _ => b'N',
         })
         .collect()
-}
-
-fn open_maybe_gz(path: &str) -> Result<Box<dyn BufRead>> {
-    let file = File::open(path).with_context(|| format!("failed to open {path}"))?;
-    if path.ends_with(".gz") {
-        Ok(Box::new(BufReader::new(flate2::read::MultiGzDecoder::new(
-            file,
-        ))))
-    } else {
-        Ok(Box::new(BufReader::new(file)))
-    }
 }
 
 fn merge_intervals(mut intervals: Vec<ContaminantInterval>) -> Vec<ContaminantInterval> {

@@ -26,6 +26,7 @@ pub struct PlotOptions {
     pub ruler_height: u32,
     pub reference_height: u32,
     pub base_track_height: u32,
+    pub show_reference_base_track: bool,
     pub gene_height: u32,
     pub sample_label_height: u32,
     pub read_track_gap: u32,
@@ -36,6 +37,8 @@ pub struct PlotOptions {
     pub margin_bottom: u32,
     pub min_alt_af: f32,
     pub font_family: String,
+    pub squash: bool,
+    pub show_sample_base_track: bool,
     pub style: PlotStyle,
 }
 
@@ -49,8 +52,9 @@ impl Default for PlotOptions {
             ruler_height: 42,
             reference_height: 28,
             base_track_height: 28,
+            show_reference_base_track: true,
             gene_height: 54,
-            sample_label_height: 26,
+            sample_label_height: 18,
             read_track_gap: 8,
             sample_gap: 18,
             margin_left: 96,
@@ -59,6 +63,8 @@ impl Default for PlotOptions {
             margin_bottom: 34,
             min_alt_af: 0.20,
             font_family: "sans-serif".to_string(),
+            squash: false,
+            show_sample_base_track: false,
             style: PlotStyle::default(),
         }
     }

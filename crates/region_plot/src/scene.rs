@@ -1,7 +1,8 @@
-use crate::layout::place_reads;
-use crate::model::{GeneModel, ReadModel, ReadSegment, RegionPlot, SamplePlotData};
+use crate::layout::{place_genes, place_reads};
+use crate::model::{BasePileup, GeneModel, ReadModel, ReadSegment, RegionPlot, SamplePlotData};
 use crate::render::PlotOptions;
 use plotters::style::RGBColor;
+use std::collections::HashSet;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rgb(pub u8, pub u8, pub u8);
@@ -113,12 +114,14 @@ pub fn build_scene(plot: &RegionPlot, opts: &PlotOptions) -> Scene {
 
     if !plot.genes.is_empty() {
         draw_genes(&mut elements, &plot.genes, plot, opts, geom, y);
-        y += opts.gene_height as f64;
+        y += gene_track_height(plot, opts) as f64;
     }
 
-    if let Some(reference) = &plot.reference {
-        draw_reference_strip(&mut elements, reference, plot, opts, geom, y);
-        y += opts.reference_height as f64;
+    if opts.show_reference_base_track {
+        if let Some(reference) = &plot.reference {
+            draw_reference_strip(&mut elements, reference, plot, opts, geom, y);
+            y += opts.reference_height as f64;
+        }
     }
 
     for sample in &plot.samples {
@@ -139,12 +142,8 @@ pub(crate) fn resolved_height(plot: &RegionPlot, opts: &PlotOptions) -> u32 {
         .iter()
         .map(|sample| sample_height(sample, opts))
         .sum();
-    let gene_h = if plot.genes.is_empty() {
-        0
-    } else {
-        opts.gene_height
-    };
-    let reference_h = if plot.reference.is_some() {
+    let gene_h = gene_track_height(plot, opts);
+    let reference_h = if plot.reference.is_some() && opts.show_reference_base_track {
         opts.reference_height
     } else {
         0
@@ -160,13 +159,33 @@ pub(crate) fn resolved_height(plot: &RegionPlot, opts: &PlotOptions) -> u32 {
 }
 
 fn sample_height(sample: &SamplePlotData, opts: &PlotOptions) -> u32 {
-    let (_, lanes) = place_reads(&sample.reads);
+    let (_, lanes) = place_reads(&sample.reads, opts.squash);
+    let lane_h = if opts.squash { 3 } else { 14 };
+    let gap = if opts.squash { 0 } else { 2 };
+    let base_track_h = if opts.show_sample_base_track {
+        opts.reference_height
+    } else {
+        0
+    };
     opts.sample_label_height
         + opts.coverage_height
-        + opts.base_track_height
-        + opts.read_track_gap
-        + lanes.max(1) as u32 * opts.lane_height
+        + base_track_h
+        + if base_track_h > 0 {
+            opts.read_track_gap
+        } else {
+            opts.read_track_gap / 2
+        }
+        + (lanes as u32 * (lane_h + gap))
         + opts.sample_gap
+}
+
+fn gene_track_height(plot: &RegionPlot, _opts: &PlotOptions) -> u32 {
+    if plot.genes.is_empty() {
+        0
+    } else {
+        let (_, lanes) = place_genes(&plot.genes);
+        (lanes.max(1) as u32 * 16) + 10
+    }
 }
 
 fn draw_ruler(
@@ -216,86 +235,282 @@ fn draw_genes(
 ) {
     elements.push(VisualElement::Text {
         x: 12.0,
-        y: y + 22.0,
+        y: y + 16.0,
         text: "Genes".to_string(),
         color: opts.style.text.into(),
         size: 13,
     });
-    for (idx, gene) in genes.iter().enumerate() {
-        let lane_y = y + 18.0 + (idx % 2) as f64 * 18.0;
+    let (placed_genes, _) = place_genes(genes);
+    let mut labeled_names = HashSet::new();
+    for placed in placed_genes {
+        let gene = placed.gene;
+        // Draw intron lines with strand arrows
+        let lane_y = y + 14.0 + placed.lane as f64 * 16.0;
         let x1 = geom.x(gene.start, plot);
         let x2 = geom.x(gene.end, plot).max(x1 + 1.0);
+        let (gene_color, exon_color) = gene_colors(gene, opts);
         elements.push(VisualElement::Line {
             x1,
             y1: lane_y,
             x2,
             y2: lane_y,
-            color: opts.style.gene.into(),
-            width: 2,
+            color: gene_color.into(),
+            width: 1,
         });
+
+        // Add strand arrows
+        if let Some(strand) = gene.strand {
+            let px_per_base = geom.width / plot.span() as f64;
+            let arrow_spacing = (100.0 / px_per_base).max(20.0);
+            let mut arrow_pos = (gene.start as f64 / arrow_spacing).ceil() * arrow_spacing;
+            while arrow_pos < gene.end as f64 {
+                if arrow_pos > gene.start as f64 {
+                    let ax = geom.x(arrow_pos as i64, plot);
+                    if ax > x1 + 5.0 && ax < x2 - 5.0 {
+                        let dx1 = if strand == '+' { -3.0 } else { 3.0 };
+                        elements.push(VisualElement::Line {
+                            x1: ax + dx1,
+                            y1: lane_y - 3.0,
+                            x2: ax,
+                            y2: lane_y,
+                            color: gene_color.into(),
+                            width: 1,
+                        });
+                        elements.push(VisualElement::Line {
+                            x1: ax + dx1,
+                            y1: lane_y + 3.0,
+                            x2: ax,
+                            y2: lane_y,
+                            color: gene_color.into(),
+                            width: 1,
+                        });
+                    }
+                }
+                arrow_pos += arrow_spacing;
+            }
+        }
+
         for &(start, end) in &gene.exons {
             let ex1 = geom.x(start, plot);
+            let ex2 = geom.x(end, plot).max(ex1 + 2.0);
             elements.push(VisualElement::Rect {
                 x1: ex1,
-                y1: lane_y - 5.0,
-                x2: geom.x(end, plot).max(ex1 + 2.0),
-                y2: lane_y + 5.0,
-                color: opts.style.exon.into(),
+                y1: lane_y - 4.0,
+                x2: ex2,
+                y2: lane_y + 4.0,
+                color: exon_color.into(),
             });
         }
-        elements.push(VisualElement::Text {
-            x: x1,
-            y: lane_y - 8.0,
-            text: gene.name.clone(),
-            color: opts.style.text.into(),
-            size: 11,
-        });
+        if x2 - x1 > 16.0 && labeled_names.insert(gene.name.clone()) {
+            let text_x = x1.max(geom.x0 + 4.0);
+            elements.push(VisualElement::Text {
+                x: text_x,
+                y: lane_y - 10.0,
+                text: gene.name.clone(),
+                color: opts.style.text.into(),
+                size: 11,
+            });
+        }
     }
 }
 
-fn draw_reference_strip(
+enum BaseSource<'a> {
+    Ref(&'a [u8]),
+    Pileup(&'a [BasePileup]),
+}
+
+impl<'a> BaseSource<'a> {
+    fn len(&self) -> usize {
+        match self {
+            BaseSource::Ref(r) => r.len(),
+            BaseSource::Pileup(p) => p.len(),
+        }
+    }
+
+    fn get_counts(&self, idx: usize) -> [u32; 5] {
+        match self {
+            BaseSource::Ref(r) => {
+                let mut c = [0; 5];
+                if let Some(&b) = r.get(idx) {
+                    match b.to_ascii_uppercase() {
+                        b'A' => c[0] = 1,
+                        b'C' => c[1] = 1,
+                        b'G' => c[2] = 1,
+                        b'T' => c[3] = 1,
+                        _ => c[4] = 1,
+                    }
+                }
+                c
+            }
+            BaseSource::Pileup(p) => {
+                let mut c = [0; 5];
+                if let Some(pile) = p.get(idx) {
+                    c[0] = pile.a;
+                    c[1] = pile.c;
+                    c[2] = pile.g;
+                    c[3] = pile.t;
+                    c[4] = pile.n;
+                }
+                c
+            }
+        }
+    }
+
+    fn get_range_counts(&self, start: usize, end: usize) -> [u32; 5] {
+        let mut total = [0; 5];
+        for i in start..end {
+            let c = self.get_counts(i);
+            for j in 0..5 {
+                total[j] += c[j];
+            }
+        }
+        total
+    }
+
+    fn dominant_base_in_range(&self, start: usize, end: usize) -> u8 {
+        let counts = self.get_range_counts(start, end);
+        let (idx, _) = counts
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, &count)| count)
+            .unwrap_or((4, &0));
+        [b'A', b'C', b'G', b'T', b'N'][idx]
+    }
+}
+
+fn draw_base_track_internal(
     elements: &mut Vec<VisualElement>,
-    reference: &[u8],
+    source: BaseSource,
+    label: &str,
     plot: &RegionPlot,
     opts: &PlotOptions,
     geom: PlotGeom,
     y: f64,
+    height: f64,
+    show_allele_freq: bool,
+    margin: f64,
 ) {
-    elements.push(VisualElement::Text {
-        x: 12.0,
-        y: y + 18.0,
-        text: "Reference".to_string(),
-        color: opts.style.text.into(),
-        size: 13,
-    });
-    let px_per_base = geom.width / plot.span() as f64;
-    let draw_text = px_per_base > 8.0;
-    for (idx, base) in reference.iter().enumerate() {
-        let pos = plot.start + idx as i64;
-        if pos >= plot.end {
-            break;
-        }
-        if *base == b'N' {
-            continue;
-        }
-        let x1 = geom.x(pos, plot);
-        let x2 = geom.base_x2(pos, plot);
-        elements.push(VisualElement::Rect {
-            x1,
-            y1: y + 4.0,
-            x2,
-            y2: y + opts.reference_height as f64 - 4.0,
-            color: base_color(*base).into(),
+    if !label.is_empty() {
+        elements.push(VisualElement::Text {
+            x: 12.0,
+            y: y + 18.0,
+            text: label.to_string(),
+            color: opts.style.text.into(),
+            size: 13,
         });
-        if draw_text {
-            elements.push(VisualElement::Text {
-                x: x1 + (x2 - x1) * 0.32,
-                y: y + opts.reference_height as f64 - 8.0,
-                text: (*base as char).to_string(),
-                color: Rgb(255, 255, 255),
-                size: 12,
+    }
+
+    let px_per_base = geom.width / plot.span() as f64;
+    let draw_text = px_per_base > 10.0;
+
+    if px_per_base >= 1.0 {
+        for idx in 0..source.len() {
+            let pos = plot.start + idx as i64;
+            if pos >= plot.end {
+                break;
+            }
+
+            let counts = source.get_counts(idx);
+            let total: u32 = counts.iter().sum::<u32>().max(1);
+
+            let mut lanes = Vec::new();
+            for (i, &base) in [b'A', b'C', b'G', b'T'].iter().enumerate() {
+                if counts[i] > 0 {
+                    lanes.push((base, counts[i] as f32 / total as f32));
+                }
+            }
+            lanes.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+            let x1 = geom.x(pos, plot);
+            let x2 = geom.base_x2(pos, plot);
+            let mut current_y = y + margin;
+            let track_h = height - 2.0 * margin;
+
+            if !show_allele_freq || lanes.len() <= 1 {
+                let base = source.dominant_base_in_range(idx, idx + 1);
+                if base != b'N' {
+                    elements.push(VisualElement::Rect {
+                        x1,
+                        y1: current_y,
+                        x2,
+                        y2: current_y + track_h,
+                        color: base_color(base).into(),
+                    });
+                    if draw_text {
+                        let text_size = (track_h * 0.85).clamp(8.0, 16.0) as u32;
+                        let text_x = x1 + (x2 - x1) * 0.5 - (text_size as f64 * 0.3);
+                        let text_y = current_y + track_h * 0.5 + (text_size as f64 * 0.35);
+                        elements.push(VisualElement::Text {
+                            x: text_x,
+                            y: text_y,
+                            text: (base as char).to_string(),
+                            color: Rgb(255, 255, 255),
+                            size: text_size,
+                        });
+                    }
+                }
+            } else {
+                for (base, frac) in lanes {
+                    let h = track_h * frac as f64;
+                    let y1 = current_y;
+                    let y2 = y1 + h;
+                    current_y = y2;
+                    elements.push(VisualElement::Rect {
+                        x1,
+                        y1,
+                        x2,
+                        y2,
+                        color: base_color(base).into(),
+                    });
+                    if draw_text && h > 8.0 {
+                        let text_size = (h * 0.85).clamp(8.0, 16.0) as u32;
+                        let text_x = x1 + (x2 - x1) * 0.5 - (text_size as f64 * 0.3);
+                        let text_y = y1 + h * 0.5 + (text_size as f64 * 0.35);
+                        elements.push(VisualElement::Text {
+                            x: text_x,
+                            y: text_y,
+                            text: (base as char).to_string(),
+                            color: Rgb(255, 255, 255),
+                            size: text_size,
+                        });
+                    }
+                }
+            }
+        }
+    } else {
+        // Aggregated view (Zoom out) - Always use dominant base to avoid "scrambled" look
+        let bases_per_px = 1.0 / px_per_base;
+        let track_h = height - 2.0 * margin;
+        for x_px in 0..geom.width as i32 {
+            let b_start = (x_px as f64 * bases_per_px).floor() as usize;
+            let b_end = ((x_px + 1) as f64 * bases_per_px).ceil() as usize;
+            let b_end = b_end.min(source.len());
+            if b_start >= b_end {
+                continue;
+            }
+
+            let base = source.dominant_base_in_range(b_start, b_end);
+            if base == b'N' {
+                continue;
+            }
+
+            let x1 = geom.x0 + x_px as f64;
+            elements.push(VisualElement::Rect {
+                x1,
+                y1: y + margin,
+                x2: x1 + 1.0,
+                y2: y + margin + track_h,
+                color: base_color(base).into(),
             });
         }
+    }
+}
+
+fn gene_colors(gene: &GeneModel, opts: &PlotOptions) -> (RGBColor, RGBColor) {
+    if gene.strand == Some('-') {
+        (opts.style.gene_reverse, opts.style.exon_reverse)
+    } else {
+        (opts.style.gene, opts.style.exon)
     }
 }
 
@@ -317,8 +532,12 @@ fn draw_sample(
     let coverage_y = y + opts.sample_label_height as f64;
     draw_coverage(elements, sample, plot, opts, geom, coverage_y);
     let base_y = coverage_y + opts.coverage_height as f64;
-    draw_sample_base_track(elements, sample, plot, opts, geom, base_y);
-    let read_y = base_y + opts.base_track_height as f64 + opts.read_track_gap as f64;
+    let read_y = if opts.show_sample_base_track {
+        draw_sample_base_track(elements, sample, plot, opts, geom, base_y);
+        base_y + opts.reference_height as f64 + opts.read_track_gap as f64
+    } else {
+        base_y + (opts.read_track_gap / 2) as f64
+    };
     draw_reads(elements, sample, plot, opts, geom, read_y);
 }
 
@@ -364,65 +583,50 @@ fn draw_coverage(
 
 fn draw_sample_base_track(
     elements: &mut Vec<VisualElement>,
-    sample: &SamplePlotData,
+    _sample: &SamplePlotData,
     plot: &RegionPlot,
     opts: &PlotOptions,
     geom: PlotGeom,
     y: f64,
 ) {
-    if sample.pileup.is_empty() {
-        return;
-    }
-    let reference = plot.reference.as_ref();
-    let px_per_base = geom.width / plot.span() as f64;
-    let draw_text = px_per_base > 10.0;
-    for (idx, pile) in sample.pileup.iter().enumerate() {
-        let pos = plot.start + idx as i64;
-        if pos >= plot.end {
-            break;
-        }
-        let ref_base = reference
-            .and_then(|seq| seq.get(idx))
-            .copied()
-            .unwrap_or(b'N');
-        let total = pile.depth().max(1) as f32;
-        let mut lanes = Vec::new();
-        for base in [b'A', b'C', b'G', b'T'] {
-            let count = pile.base_count(base);
-            if count > 0
-                && (reference.is_none() || base == ref_base || (count as f32 / total) >= opts.min_alt_af)
-            {
-                lanes.push(base);
-            }
-        }
-        if lanes.is_empty() && reference.is_some() {
-            lanes.push(ref_base);
-        } else if lanes.is_empty() {
-            continue;
-        }
-        let lane_h = (opts.base_track_height as f64 - 4.0) / lanes.len().max(1) as f64;
-        for (lane_idx, base) in lanes.into_iter().enumerate() {
-            let x1 = geom.x(pos, plot);
-            let x2 = geom.base_x2(pos, plot);
-            let y1 = y + 2.0 + lane_idx as f64 * lane_h;
-            elements.push(VisualElement::Rect {
-                x1,
-                y1,
-                x2,
-                y2: y1 + lane_h.max(1.0),
-                color: base_color(base).into(),
-            });
-            if draw_text {
-                elements.push(VisualElement::Text {
-                    x: x1 + (x2 - x1) * 0.30,
-                    y: y1 + lane_h - 2.0,
-                    text: (base as char).to_string(),
-                    color: Rgb(255, 255, 255),
-                    size: 10,
-                });
-            }
-        }
-    }
+    let reference = match plot.reference.as_ref() {
+        Some(r) => r,
+        None => return,
+    };
+    draw_base_track_internal(
+        elements,
+        BaseSource::Ref(reference),
+        "",
+        plot,
+        opts,
+        geom,
+        y,
+        opts.reference_height as f64,
+        false,
+        4.0,
+    );
+}
+
+fn draw_reference_strip(
+    elements: &mut Vec<VisualElement>,
+    reference: &[u8],
+    plot: &RegionPlot,
+    opts: &PlotOptions,
+    geom: PlotGeom,
+    y: f64,
+) {
+    draw_base_track_internal(
+        elements,
+        BaseSource::Ref(reference),
+        "Reference",
+        plot,
+        opts,
+        geom,
+        y,
+        opts.reference_height as f64,
+        false,
+        4.0,
+    );
 }
 
 fn draw_reads(
@@ -433,7 +637,7 @@ fn draw_reads(
     geom: PlotGeom,
     y: f64,
 ) {
-    let (placed_reads, lanes) = place_reads(&sample.reads);
+    let (placed_reads, lanes) = place_reads(&sample.reads, opts.squash);
     if lanes > 10 {
         for lane in (10..lanes).step_by(10) {
             let line_y = y + lane as f64 * opts.lane_height as f64;
@@ -454,7 +658,7 @@ fn draw_reads(
             plot,
             opts,
             geom,
-            y + placed.lane as f64 * opts.lane_height as f64,
+            y + placed.lane as f64 * (if opts.squash { 3.0 } else { 16.0 }),
         );
     }
 }
@@ -472,7 +676,7 @@ fn draw_read(
         Some(2) => opts.style.haplotype_2,
         _ => opts.style.read_forward,
     };
-    let h = (opts.lane_height as f64 * 0.62).max(3.0);
+    let h = if opts.squash { 3.0 } else { 12.0 };
     let visible_match_start = read
         .segments
         .iter()
@@ -547,6 +751,18 @@ fn draw_read(
                     color: lighten(read_color, 0.45).into(),
                 });
             }
+            ReadSegment::Skip { ref_start, len } => elements.push(VisualElement::Line {
+                x1: geom.x(*ref_start, plot),
+                y1: y + h / 2.0,
+                x2: geom.x(*ref_start + *len, plot),
+                y2: y + h / 2.0,
+                color: if opts.squash {
+                    Rgb(150, 150, 150)
+                } else {
+                    Rgb(205, 205, 205)
+                },
+                width: 1,
+            }),
         }
     }
     for modification in &read.modifications {

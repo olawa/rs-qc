@@ -126,6 +126,10 @@ pub enum ReadSegment {
         ref_pos: i64,
         bases: Vec<u8>,
     },
+    Skip {
+        ref_start: i64,
+        len: i64,
+    },
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
