@@ -54,6 +54,8 @@ pub struct RnaQcConfig {
     pub three_prime_min_anchor_nonzero_bins: usize,
     pub three_prime_max_ratio: f64,
     pub write_counts: bool,
+    pub write_gene_profiles: bool,
+    pub compact_gene_profiles: bool,
     pub dense_map_workers: usize,
     pub dense_map_scope: DenseMapScope,
     pub dense_map_chunk_size: u64,

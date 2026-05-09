@@ -285,15 +285,16 @@ fn scan_indexed_window(
         }
 
         if let Some(chrom_index) = maybe_feature {
-            if let Some((first_match, last_match)) = read_match_span {
-                let mid = first_match + (last_match - first_match) / 2;
-                if mid >= win_start && mid < win_end {
-                    state.total_tags += 1;
-                    if let Some(cursor) = feature_cursor.as_mut() {
-                        let region = chrom_index.classify(mid, cursor);
-                        state.read_dist_counts[region as usize] += 1;
-                    }
+            if owns_start {
+                state.total_tags += 1;
+                if let Some(cursor) = feature_cursor.as_mut() {
+                    let region = chrom_index.classify(pos, cursor);
+                    state.read_dist_counts[region as usize] += 1;
                 }
+            }
+        } else {
+            if owns_start {
+                state.unknown_chrom_reads += 1;
             }
         }
 

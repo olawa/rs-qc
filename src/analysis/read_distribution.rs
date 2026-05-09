@@ -75,6 +75,7 @@ impl FeatureMap {
         }
     }
 
+    #[allow(dead_code)]
     pub fn get_region(&self, pos: u64) -> RegionType {
         let win_idx = (pos / self.window_size) as usize;
         let offset = (pos % self.window_size) as usize;

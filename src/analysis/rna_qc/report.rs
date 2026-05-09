@@ -48,13 +48,19 @@ pub(crate) fn write_sample_reports(
     sample_name: &str,
     stats: &AggregatedStats,
 ) -> Result<()> {
-    if config
-        .analysis
-        .contains(&crate::analysis::types::AnalysisType::ThreePrime)
+    if config.write_gene_profiles
+        && config
+            .analysis
+            .contains(&crate::analysis::types::AnalysisType::ThreePrime)
     {
+        let tsv_start = std::time::Instant::now();
         let profiles_path = format!("{}.{}.gene_profiles.tsv", config.output, sample_name);
-        write_gene_profiles_tsv(&profiles_path, &stats.gene_qc)?;
-        println!("Gene profiles written to: {}", profiles_path);
+        write_gene_profiles_tsv(&profiles_path, &stats.gene_qc, config.compact_gene_profiles)?;
+        println!(
+            "Gene profiles written to: {} (took: {:?})",
+            profiles_path,
+            tsv_start.elapsed()
+        );
     }
 
     if config.write_counts {
@@ -76,7 +82,9 @@ pub(crate) fn write_sample_visual_reports(
     genes: &[Gene],
     annotation_format: AnnotationFormat,
 ) -> Result<()> {
+    let term_start = std::time::Instant::now();
     print_terminal_summary(sample_name, stats, qc, read_dist_counts)?;
+    println!("  - Terminal summary rendering took: {:?}", term_start.elapsed());
     write_sample_summary_json(config, sample_name, stats, qc, read_dist_counts)?;
 
     if !config.no_plot {
@@ -286,8 +294,11 @@ fn print_terminal_summary(
     );
     let read_dist = read_distribution_percentages(read_dist_counts);
     println!(
-        "Read distribution:       exon {:.1}% | intron {:.1}% | flank {:.1}% | intergenic {:.1}%",
-        read_dist.exonic, read_dist.intronic, read_dist.flanking, read_dist.intergenic
+        "Read distribution:       exon {:.1}% ({}) | intron {:.1}% ({}) | flank {:.1}% ({}) | intergenic {:.1}% ({})",
+        read_dist.exonic, read_dist.exonic_count,
+        read_dist.intronic, read_dist.intronic_count,
+        read_dist.flanking, read_dist.flanking_count,
+        read_dist.intergenic, read_dist.intergenic_count
     );
     println!("Strandness:              {}", qc.inferred_strandness());
     println!(
@@ -298,6 +309,10 @@ fn print_terminal_summary(
     );
     println!("Gene-body genes:         {}", stats.active_genes);
     println!("3' profile genes:        {}", stats.active_3p_genes);
+    if stats.unknown_chrom_reads > 0 {
+        println!("Unknown chrom reads:     {}", stats.unknown_chrom_reads);
+    }
+    println!("Total tags assigned:     {}", stats.total_tags);
     Ok(())
 }
 
@@ -315,6 +330,10 @@ struct ReadDistributionPercentages {
     intronic: f64,
     flanking: f64,
     intergenic: f64,
+    exonic_count: u64,
+    intronic_count: u64,
+    flanking_count: u64,
+    intergenic_count: u64,
 }
 
 fn read_distribution_percentages(read_dist_counts: &[u64; 12]) -> ReadDistributionPercentages {
@@ -339,6 +358,10 @@ fn read_distribution_percentages(read_dist_counts: &[u64; 12]) -> ReadDistributi
         intronic: percent_from_counts(intronic, total),
         flanking: percent_from_counts(flanking, total),
         intergenic: percent_from_counts(intergenic, total),
+        exonic_count: exonic,
+        intronic_count: intronic,
+        flanking_count: flanking,
+        intergenic_count: intergenic,
     }
 }
 

@@ -40,6 +40,7 @@ pub enum ReadEndType {
 }
 
 impl RnaSeqQcSummary {
+    #[allow(dead_code)]
     pub fn observe_inner_distance(&mut self, dist: i32) {
         self.inner_distances.push(dist as i64);
     }
@@ -113,6 +114,7 @@ impl RnaSeqQcSummary {
         }
     }
 
+    #[allow(dead_code)]
     pub fn inner_distance_histogram(&self) -> BTreeMap<i64, usize> {
         let mut hist = BTreeMap::new();
         for &dist in &self.inner_distances {
@@ -187,6 +189,7 @@ impl RnaSeqQcSummary {
         std::fs::write(path, self.summary_text())
     }
 
+    #[allow(dead_code)]
     pub fn write_inner_distance_histogram(&self, path: &str) -> std::io::Result<()> {
         let hist = self.inner_distance_histogram();
         let mut file = File::create(path)?;

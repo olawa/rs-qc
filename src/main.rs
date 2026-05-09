@@ -331,8 +331,11 @@ struct RnaArgs {
     pub three_prime_min_anchor_nonzero_bins: usize,
     #[arg(long, default_value_t = 3.0)]
     pub three_prime_max_ratio: f64,
-    #[arg(long, default_value_t = false)]
     pub write_counts: bool,
+    #[arg(long, default_value_t = false)]
+    pub write_gene_profiles: bool,
+    #[arg(long, default_value_t = true)]
+    pub compact_gene_profiles: bool,
     /// Number of concurrent threads for dense map construction (reduces peak memory).
     #[arg(long, default_value_t = 1)]
     pub dense_map_workers: usize,
@@ -414,6 +417,8 @@ fn run_rna_wrapper(args: RnaArgs) -> Result<()> {
         three_prime_min_anchor_nonzero_bins: args.three_prime_min_anchor_nonzero_bins,
         three_prime_max_ratio: args.three_prime_max_ratio,
         write_counts: args.write_counts,
+        write_gene_profiles: args.write_gene_profiles,
+        compact_gene_profiles: args.compact_gene_profiles,
         dense_map_workers: args.dense_map_workers,
         dense_map_scope: args.dense_map_scope,
         dense_map_chunk_size: args.dense_map_chunk_size,

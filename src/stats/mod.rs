@@ -14,6 +14,7 @@ pub fn fraction(numerator: u64, denominator: u64) -> f64 {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct AggregatedStats {
     pub dist_3p_means: Vec<f64>,
@@ -28,9 +29,12 @@ pub struct AggregatedStats {
     pub active_genes: usize,
     pub active_3p_genes: usize,
     pub total_reads: u64,
+    pub total_tags: u64,
+    pub unknown_chrom_reads: u64,
     pub gene_qc: Vec<ThreePrimeGeneQc>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ThreePrimeGeneQc {
     pub gene_id: String,
@@ -64,7 +68,7 @@ pub fn aggregate_genes(
     index: &AnnotationIndex,
     min_support: usize,
     three_prime_params: &ThreePrimeParams,
-    total_reads: u64,
+    state: &crate::analysis::rna_qc::state::RnaWorkerState,
     _is_ends_mode: bool,
 ) -> AggregatedStats {
     let n_3p_bins = (three_prime_params.max_3p_dist + three_prime_params.bin_size - 1)
@@ -291,7 +295,9 @@ pub fn aggregate_genes(
         bin_size: three_prime_params.bin_size,
         active_genes,
         active_3p_genes,
-        total_reads,
+        total_reads: state.records_seen,
+        total_tags: state.total_tags,
+        unknown_chrom_reads: state.unknown_chrom_reads,
         gene_qc,
     }
 }
@@ -497,6 +503,7 @@ pub fn aggregate_rseqc_stratified(
     result
 }
 
+#[allow(dead_code)]
 pub fn write_tsv(path: &str, header: &str, data: &[f64], support: &[usize]) -> std::io::Result<()> {
     let mut file = File::create(path)?;
     writeln!(file, "{}", header)?;
@@ -569,32 +576,26 @@ pub fn write_classic_wide_format(
     Ok(())
 }
 
-pub fn write_gene_profiles_tsv(path: &str, qc_data: &[ThreePrimeGeneQc]) -> anyhow::Result<()> {
-    let mut file = File::create(path)?;
+pub fn write_gene_profiles_tsv(
+    path: &str,
+    qc_data: &[ThreePrimeGeneQc],
+    compact: bool,
+) -> anyhow::Result<()> {
+    use std::io::BufWriter;
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+
     writeln!(
-        file,
+        writer,
         "gene_id\tgene_name\ttranscript_id\tchrom\tstrand\tlength\tgene_body_bin_count\tanchor_3p_count\tmean_body_coverage\tanchor_mean_coverage\tused_for_3p\tskip_reason\tcounts_3p_csv\tcounts_percentile_csv"
     )?;
 
     for q in qc_data {
-        let counts_3p_csv = q
-            .counts_3p
-            .iter()
-            .map(|c| c.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        let counts_pct_csv = q
-            .counts_percentile
-            .iter()
-            .map(|c| c.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-
         let mean_body = q.total_pct_count as f64 / 100.0;
 
-        writeln!(
-            file,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{}\t{}\t{}\t{}",
+        write!(
+            writer,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{}\t{}",
             q.gene_id,
             q.gene_name.as_deref().unwrap_or("-"),
             q.transcript_id.as_deref().unwrap_or("-"),
@@ -606,10 +607,28 @@ pub fn write_gene_profiles_tsv(path: &str, qc_data: &[ThreePrimeGeneQc]) -> anyh
             mean_body,
             q.anchor_mean,
             q.used,
-            q.skip_reason.as_deref().unwrap_or("-"),
-            counts_3p_csv,
-            counts_pct_csv
+            q.skip_reason.as_deref().unwrap_or("-")
         )?;
+
+        if !compact {
+            write!(writer, "\t")?;
+            for (i, &c) in q.counts_3p.iter().enumerate() {
+                if i > 0 {
+                    write!(writer, ",")?;
+                }
+                write!(writer, "{}", c)?;
+            }
+            write!(writer, "\t")?;
+            for (i, &c) in q.counts_percentile.iter().enumerate() {
+                if i > 0 {
+                    write!(writer, ",")?;
+                }
+                write!(writer, "{}", c)?;
+            }
+        } else {
+            write!(writer, "\t[compacted]\t[compacted]")?;
+        }
+        writeln!(writer)?;
     }
 
     Ok(())

@@ -443,6 +443,7 @@ fn merge_intervals(mut intervals: Vec<ContaminantInterval>) -> Vec<ContaminantIn
     merged
 }
 
+#[allow(dead_code)]
 fn sequence_has_kmer_hits(
     seq: &[u8],
     kmers: &std::collections::HashSet<Vec<u8>>,

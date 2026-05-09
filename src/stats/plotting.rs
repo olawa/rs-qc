@@ -180,6 +180,18 @@ pub fn generate_multi_3p_dist_plot(
         }
     }
 
+    // Add vertical markers at 5kb and 10kb
+    for &x in &[5000.0, 10000.0] {
+        plots.push(
+            LinePlot::new()
+                .with_data(vec![(x, 0.0), (x, 2.0)])
+                .with_color("#888")
+                .with_line_style(LineStyle::Dashed)
+                .with_stroke_width(1.0)
+                .into(),
+        );
+    }
+
     let title = if subtitle_parts.is_empty() {
         "3' Distance Bias Profile (Combined)".to_string()
     } else {
@@ -201,6 +213,7 @@ pub fn generate_multi_3p_dist_plot(
 }
 
 /// Generates a single profile plot for 3' Distance Bias.
+#[allow(dead_code)]
 pub fn generate_3p_dist_plot(
     sample_id: &str,
     data: &[f64],
@@ -392,6 +405,18 @@ fn build_rna_qc_summary_figure(
         .with_color("darkorange")
         .with_stroke_width(2.0);
 
+    let mut three_prime_plots = vec![Plot::Line(three_prime_plot)];
+    for &x in &[5000.0, 10000.0] {
+        three_prime_plots.push(
+            LinePlot::new()
+                .with_data(vec![(x, 0.0), (x, 1.5)])
+                .with_color("#aaa")
+                .with_line_style(LineStyle::Dashed)
+                .with_stroke_width(1.0)
+                .into(),
+        );
+    }
+
     let raw_three_prime_plot = LinePlot::new()
         .with_data(
             stats
@@ -464,7 +489,7 @@ fn build_rna_qc_summary_figure(
 
     let mut plots: Vec<Vec<Plot>> = vec![
         vec![Plot::Line(gene_body_plot)],
-        vec![Plot::Line(three_prime_plot)],
+        three_prime_plots,
         vec![Plot::Line(inner_distance_plot)],
         vec![Plot::Bar(read_distribution_plot)],
     ];

@@ -1,5 +1,6 @@
 use crate::models::Exon;
 
+#[allow(dead_code)]
 pub struct Fragment {
     pub chrom: String,
     pub aligned_blocks: Vec<Exon>, // Genomic segments representing the physical molecule

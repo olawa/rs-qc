@@ -57,12 +57,20 @@ pub struct FastqQcMetrics {
     pub paired_name_mismatches: u64,
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default)]
 pub struct BasePositionMetrics {
     pub count: u64,
     pub qual_sum: u64,
     pub bases: [u64; 5],
     pub qual_hist: BTreeMap<u8, u64>,
+    pub adapter_hits: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct BasePositionSummary {
+    pub count: u64,
+    pub mean_quality: f64,
+    pub bases: [u64; 5],
     pub adapter_hits: u64,
 }
 
@@ -100,7 +108,7 @@ pub struct FastqQcSummary {
     pub n_reads: u64,
     pub paired_reads_checked: u64,
     pub paired_name_mismatches: u64,
-    pub per_base: Vec<BasePositionMetrics>,
+    pub per_base: Vec<BasePositionSummary>,
 }
 
 #[derive(Debug, Serialize)]
@@ -446,7 +454,19 @@ impl FastqQcMetrics {
             n_reads: self.n_reads,
             paired_reads_checked: self.paired_reads_checked,
             paired_name_mismatches: self.paired_name_mismatches,
-            per_base: self.per_base.clone(),
+            per_base: self
+                .per_base
+                .iter()
+                .map(|p| {
+                    let count = p.count.max(1);
+                    BasePositionSummary {
+                        count: p.count,
+                        mean_quality: p.qual_sum as f64 / count as f64,
+                        bases: p.bases,
+                        adapter_hits: p.adapter_hits,
+                    }
+                })
+                .collect(),
         }
     }
 }

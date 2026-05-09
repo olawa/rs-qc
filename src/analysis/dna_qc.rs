@@ -13,6 +13,7 @@ use std::io::{BufRead, BufReader, Write};
 
 const BREADTH_THRESHOLDS: [u32; 5] = [1, 5, 10, 20, 30];
 
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct DnaQcConfig {
     pub inputs: Vec<String>,

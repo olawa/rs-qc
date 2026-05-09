@@ -163,6 +163,7 @@ impl AnnotationIndex {
         })
     }
 
+    #[allow(dead_code)]
     pub fn build_feature_map(&self, chrom: &str, size: u64) -> Option<FeatureMap> {
         let chrom_norm = normalize_chrom(chrom);
         let gene_indices = self.genes_by_chrom.get(chrom_norm.as_ref())?;

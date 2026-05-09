@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use noodles::bam;
 use noodles::sam;
-use rayon::prelude::*;
 use std::fs::File;
 use std::num::NonZeroUsize;
 use std::path::Path;

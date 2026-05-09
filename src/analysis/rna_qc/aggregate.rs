@@ -8,7 +8,7 @@ use crate::stats::{
 pub(crate) fn aggregate_sample(
     index: &AnnotationIndex,
     config: &RnaQcConfig,
-    total_reads: u64,
+    state: &crate::analysis::rna_qc::state::RnaWorkerState,
 ) -> AggregatedStats {
     let three_prime_params = ThreePrimeParams {
         normalization_bp: config.normalization_bp,
@@ -24,7 +24,7 @@ pub(crate) fn aggregate_sample(
         index,
         config.min_support,
         &three_prime_params,
-        total_reads,
+        state,
         false,
     );
 

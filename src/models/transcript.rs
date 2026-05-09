@@ -18,6 +18,7 @@ pub struct Transcript {
     pub cds_end: Option<u64>,   // Genomic 0-based, half-open
 }
 
+#[allow(dead_code)]
 impl Transcript {
     pub fn new(
         id: String,

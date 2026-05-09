@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::num::NonZeroUsize;
 
+#[allow(dead_code)]
 pub enum QcMolecule {
     Single {
         chrom: String,
@@ -22,6 +23,7 @@ pub enum QcMolecule {
     },
 }
 
+#[allow(dead_code)]
 pub struct BamFragmentIterator {
     reader: bam::io::Reader<noodles::bgzf::MultithreadedReader<File>>,
     header: sam::Header,
@@ -178,6 +180,7 @@ impl Iterator for BamFragmentIterator {
     }
 }
 
+#[allow(dead_code)]
 fn is_sane_orientation(r1: &bam::Record, r2: &bam::Record) -> bool {
     let f1 = r1.flags();
     let f2 = r2.flags();
@@ -273,6 +276,7 @@ pub fn for_each_aligned_block(record: &bam::Record, mut visit: impl FnMut(u64, u
     }
 }
 
+#[allow(dead_code)]
 pub fn aligned_blocks(record: &bam::Record) -> Vec<Exon> {
     let mut blocks = Vec::new();
     for_each_aligned_block(record, |start, end| blocks.push(Exon { start, end }));

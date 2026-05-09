@@ -2,7 +2,7 @@ mod aggregate;
 mod config;
 mod report;
 mod scan;
-mod state;
+pub(crate) mod state;
 
 use crate::analysis::alignment_qc::sample_name_from_alignment_path;
 use crate::analysis::contamination::ContaminantIndex;
@@ -151,10 +151,10 @@ pub fn run_rna(config: RnaQcConfig) -> Result<()> {
             reader.read_header()?
         };
 
-        let finalize_start = Instant::now();
         let bai_path = crate::analysis::bam_scan::find_bai_path(bam_path);
         let mut total_state = if let (Some(bp), scope) = (&bai_path, config.dense_map_scope) {
-            match scope {
+            let scan_start = Instant::now();
+            let res = match scope {
                 DenseMapScope::Window => {
                     println!(
                         "  - DenseMap scope: Window, window size: {} bp",
@@ -277,7 +277,9 @@ pub fn run_rna(config: RnaQcConfig) -> Result<()> {
                         threads,
                     })?
                 }
-            }
+            };
+            println!("  - Main BAM scan took: {:?}", scan_start.elapsed());
+            res
         } else {
             // Fallback to All mode if no BAI or explicitly requested
             if bai_path.is_none() && config.dense_map_scope != DenseMapScope::All {
@@ -309,6 +311,7 @@ pub fn run_rna(config: RnaQcConfig) -> Result<()> {
             println!("  - Read-name pair QC scan took: {:?}", qc_start.elapsed());
         }
 
+        let finalize_start = Instant::now();
         let passed_filters = total_state.records_seen
             - total_state.fail_unmapped
             - total_state.fail_secondary
@@ -344,7 +347,7 @@ pub fn run_rna(config: RnaQcConfig) -> Result<()> {
                     let stats = aggregate::aggregate_sample(
                         index_ref,
                         config_ref,
-                        state_ref.aligned_qc_reads,
+                        state_ref,
                     );
                     println!("  - Coverage aggregation took: {:?}", agg_start.elapsed());
 
@@ -419,6 +422,7 @@ pub fn run_rna(config: RnaQcConfig) -> Result<()> {
             visual_qc.mtdna_reads = total_state.mtdna_reads;
             visual_qc.rdna_reads = total_state.rdna_reads;
 
+            let report_start = Instant::now();
             report::write_sample_reports(&config, &sample_name, &stats)?;
             report::write_sample_visual_reports(
                 &config,
@@ -430,6 +434,7 @@ pub fn run_rna(config: RnaQcConfig) -> Result<()> {
                 index_proto.genes.as_slice(),
                 ann_format,
             )?;
+            println!("  - Sample-specific reports and plots took: {:?}", report_start.elapsed());
             classic_all.insert(sample_name.to_string(), stats.percentile_means.clone());
             classic_percent_all.insert(sample_name.to_string(), stats.percentile_normalized);
             dist_3p_all.insert(sample_name.to_string(), stats.dist_3p_means.clone());
@@ -469,6 +474,7 @@ pub fn run_rna(config: RnaQcConfig) -> Result<()> {
         coverage_index_ref.reset_coverage();
     }
 
+    let multi_start = Instant::now();
     report::write_multi_sample_outputs(
         &config,
         &classic_all,
@@ -480,6 +486,7 @@ pub fn run_rna(config: RnaQcConfig) -> Result<()> {
         &inner_distance_all,
         &plot_metadata_all,
     )?;
+    println!("  - Multi-sample aggregation and TSV/SVG generation took: {:?}", multi_start.elapsed());
 
     println!("\\nAll tasks completed in {:.2?}.", start_time.elapsed());
     Ok(())

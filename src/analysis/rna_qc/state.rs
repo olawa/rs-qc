@@ -17,6 +17,7 @@ pub(crate) struct RnaWorkerState {
     pub(crate) mtdna_reads: u64,
     pub(crate) rdna_reads: u64,
     pub(crate) read_dist_counts: [u64; 12],
+    pub(crate) unknown_chrom_reads: u64,
     pub(crate) qc: InlineQcState,
 }
 
@@ -34,6 +35,7 @@ impl RnaWorkerState {
             mtdna_reads: 0,
             rdna_reads: 0,
             read_dist_counts: [0; 12],
+            unknown_chrom_reads: 0,
             qc: InlineQcState::new(qc_sample_size),
         }
     }
@@ -53,6 +55,7 @@ impl RnaWorkerState {
         for i in 0..12 {
             self.read_dist_counts[i] += other.read_dist_counts[i];
         }
+        self.unknown_chrom_reads += other.unknown_chrom_reads;
 
         self.qc.merge_from(other.qc);
         self
