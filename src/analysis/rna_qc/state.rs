@@ -102,6 +102,7 @@ impl RnaWorkerState {
             RegionType::TesDown1kb,
             RegionType::TesDown5kb,
             RegionType::TesDown10kb,
+            RegionType::Intergenic,
         ];
 
         for group in groups {

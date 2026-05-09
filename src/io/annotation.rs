@@ -1,5 +1,5 @@
-use crate::models::{Exon, Gene, Transcript};
 use crate::io::text::open_maybe_gz;
+use crate::models::{Exon, Gene, Transcript};
 use anyhow::{anyhow, Context, Result};
 use regex::Regex;
 use std::collections::HashMap;
@@ -102,8 +102,8 @@ pub fn load_annotation(
     format: AnnotationFormat,
     config: &AnnotationConfig,
 ) -> Result<LoadedAnnotation> {
-    let reader = open_maybe_gz(path)
-        .with_context(|| format!("Failed to open annotation file: {}", path))?;
+    let reader =
+        open_maybe_gz(path).with_context(|| format!("Failed to open annotation file: {}", path))?;
 
     let resolved_format = match format {
         AnnotationFormat::Auto => {

@@ -311,7 +311,22 @@ pub fn run_rna(config: RnaQcConfig) -> Result<()> {
         // Update multi-sample maps safely outside the scope
         let stats_opt = stats_res.lock().unwrap().take();
         if let Some(stats) = stats_opt {
+            let mut visual_qc = total_state.qc.summary.clone();
+            visual_qc.aligned_qc_reads = total_state.aligned_qc_reads;
+            visual_qc.mtdna_reads = total_state.mtdna_reads;
+            visual_qc.rdna_reads = total_state.rdna_reads;
+
             report::write_sample_reports(&config, &sample_name, &stats)?;
+            report::write_sample_visual_reports(
+                &config,
+                bam_path,
+                &sample_name,
+                &stats,
+                &visual_qc,
+                &total_state.read_dist_counts,
+                index_proto.genes.as_slice(),
+                ann_format,
+            )?;
             classic_all.insert(sample_name.to_string(), stats.percentile_means.clone());
             classic_percent_all.insert(sample_name.to_string(), stats.percentile_normalized);
             dist_3p_all.insert(sample_name.to_string(), stats.dist_3p_means.clone());
@@ -332,7 +347,10 @@ pub fn run_rna(config: RnaQcConfig) -> Result<()> {
         }
 
         if config.analysis.contains(&AnalysisType::Qc) {
-            let qc = total_state.qc.summary.clone();
+            let mut qc = total_state.qc.summary.clone();
+            qc.aligned_qc_reads = total_state.aligned_qc_reads;
+            qc.mtdna_reads = total_state.mtdna_reads;
+            qc.rdna_reads = total_state.rdna_reads;
             let series: Vec<f64> = qc
                 .clipped_inner_distance_series(-200, 200)
                 .into_iter()

@@ -1,4 +1,6 @@
+use crate::analysis::qc::RnaSeqQcSummary;
 use anyhow::Result;
+use kuva::backend::svg::SvgBackend;
 use kuva::prelude::*;
 use std::collections::HashMap;
 
@@ -312,4 +314,287 @@ pub fn generate_multi_inner_distance_plot(
     std::fs::write(output_path, svg)?;
 
     Ok(())
+}
+
+pub fn generate_rna_qc_summary_svg(
+    sample_name: &str,
+    stats: &crate::stats::AggregatedStats,
+    qc: &RnaSeqQcSummary,
+    read_dist_counts: &[u64; 12],
+    output_path: &str,
+) -> Result<()> {
+    let figure = build_rna_qc_summary_figure(sample_name, stats, qc, read_dist_counts, true, false)
+        .with_figure_size(1600.0, 980.0)
+        .with_title(format!("RNA QC summary for {}", sample_name))
+        .with_title_size(24)
+        .with_labels();
+    let scene = figure.render();
+    std::fs::write(output_path, SvgBackend.render_scene(&scene))?;
+    Ok(())
+}
+
+pub fn render_rna_qc_terminal_summary(
+    sample_name: &str,
+    stats: &crate::stats::AggregatedStats,
+    qc: &RnaSeqQcSummary,
+    read_dist_counts: &[u64; 12],
+) -> Result<String> {
+    let figure = build_rna_qc_summary_figure(sample_name, stats, qc, read_dist_counts, false, true)
+        .with_figure_size(1180.0, 740.0)
+        .with_title(format!("RNA QC summary for {}", sample_name))
+        .with_title_size(14);
+    let scene = figure.render();
+    let cols = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|n| n.clamp(60, 80))
+        .unwrap_or(80);
+    let rows = std::env::var("LINES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|n| n.clamp(32, 48))
+        .unwrap_or(40);
+    Ok(TerminalBackend::new(cols, rows).render_scene(&scene))
+}
+
+fn build_rna_qc_summary_figure(
+    sample_name: &str,
+    stats: &crate::stats::AggregatedStats,
+    qc: &RnaSeqQcSummary,
+    read_dist_counts: &[u64; 12],
+    include_raw_profile: bool,
+    compact_labels: bool,
+) -> Figure {
+    let gene_body_max = stats
+        .percentile_means
+        .iter()
+        .fold(0.0_f64, |acc, &v| acc.max(v))
+        .max(0.001);
+    let gene_body_plot = LinePlot::new()
+        .with_data(
+            stats
+                .percentile_means
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| (i as f64 + 1.0, (v / gene_body_max) * 100.0)),
+        )
+        .with_color("steelblue")
+        .with_stroke_width(2.0);
+
+    let three_prime_plot = LinePlot::new()
+        .with_data(
+            stats
+                .dist_3p_means
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| (i as f64 * stats.bin_size as f64, v)),
+        )
+        .with_color("darkorange")
+        .with_stroke_width(2.0);
+
+    let raw_three_prime_plot = LinePlot::new()
+        .with_data(
+            stats
+                .dist_3p_sums_raw_analyzed
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| (i as f64 * stats.bin_size as f64, v)),
+        )
+        .with_color("seagreen")
+        .with_stroke_width(2.0);
+
+    let inner_distance_plot = LinePlot::new()
+        .with_data(
+            qc.clipped_inner_distance_series(-200, 200)
+                .into_iter()
+                .enumerate()
+                .map(|(i, v)| (-200.0 + i as f64, v)),
+        )
+        .with_color("crimson")
+        .with_stroke_width(2.0);
+
+    let exonic = read_dist_counts[crate::analysis::read_distribution::RegionType::CdsExon as usize]
+        + read_dist_counts[crate::analysis::read_distribution::RegionType::Utr5Exon as usize]
+        + read_dist_counts[crate::analysis::read_distribution::RegionType::Utr3Exon as usize]
+        + read_dist_counts[crate::analysis::read_distribution::RegionType::Exon as usize];
+    let intronic =
+        read_dist_counts[crate::analysis::read_distribution::RegionType::Intron as usize];
+    let flanking = read_dist_counts
+        [crate::analysis::read_distribution::RegionType::TssUp1kb as usize]
+        + read_dist_counts[crate::analysis::read_distribution::RegionType::TssUp5kb as usize]
+        + read_dist_counts[crate::analysis::read_distribution::RegionType::TssUp10kb as usize]
+        + read_dist_counts[crate::analysis::read_distribution::RegionType::TesDown1kb as usize]
+        + read_dist_counts[crate::analysis::read_distribution::RegionType::TesDown5kb as usize]
+        + read_dist_counts[crate::analysis::read_distribution::RegionType::TesDown10kb as usize];
+    let intergenic =
+        read_dist_counts[crate::analysis::read_distribution::RegionType::Intergenic as usize];
+    let read_total = (exonic + intronic + flanking + intergenic).max(1) as f64;
+    let read_distribution_plot = category_bar_plot(vec![
+        ("Exonic", percent_from_counts(exonic, read_total), "#4e79a7"),
+        (
+            "Intronic",
+            percent_from_counts(intronic, read_total),
+            "#59a14f",
+        ),
+        (
+            "Flanking",
+            percent_from_counts(flanking, read_total),
+            "#f28e2b",
+        ),
+        (
+            "Intergenic",
+            percent_from_counts(intergenic, read_total),
+            "#b07aa1",
+        ),
+        (
+            "mtDNA",
+            percent_from_fraction(qc.mtdna_fraction()),
+            "#e15759",
+        ),
+        ("Rev strand", stranded_reverse_percent(qc), "#9c755f"),
+    ]);
+
+    let qc_plot = category_bar_plot(vec![
+        ("mtDNA", qc.mtdna_fraction() * 100.0, "#e15759"),
+        ("rDNA", qc.rdna_fraction() * 100.0, "#76b7b2"),
+        ("FR", qc.fr_fraction() * 100.0, "#59a14f"),
+        ("RF", qc.rf_fraction() * 100.0, "#4e79a7"),
+        ("Other", qc.other_fraction() * 100.0, "#edc948"),
+    ]);
+
+    let mut plots: Vec<Vec<Plot>> = vec![
+        vec![Plot::Line(gene_body_plot)],
+        vec![Plot::Line(three_prime_plot)],
+        vec![Plot::Line(inner_distance_plot)],
+        vec![Plot::Bar(read_distribution_plot)],
+    ];
+    let mut layouts = vec![
+        Layout::auto_from_plots(&plots[0])
+            .with_title(if compact_labels {
+                "Gene body"
+            } else {
+                "Gene body"
+            })
+            .with_x_label(if compact_labels {
+                ""
+            } else {
+                "5' -> 3' percentile"
+            })
+            .with_y_label(if compact_labels {
+                ""
+            } else {
+                "Relative coverage"
+            }),
+        Layout::auto_from_plots(&plots[1])
+            .with_title(if compact_labels {
+                "3' profile"
+            } else {
+                "3' anchor profile"
+            })
+            .with_x_label(if compact_labels {
+                ""
+            } else {
+                "Distance from 3' end (bp)"
+            })
+            .with_y_label(if compact_labels {
+                ""
+            } else {
+                "Normalized coverage"
+            }),
+        Layout::auto_from_plots(&plots[2])
+            .with_title(if compact_labels {
+                "Inner dist"
+            } else {
+                "Inner distance"
+            })
+            .with_x_label(if compact_labels { "" } else { "bp" })
+            .with_y_label(if compact_labels { "" } else { "Count" }),
+        Layout::auto_from_plots(&plots[3])
+            .with_title(if compact_labels {
+                "Read dist"
+            } else {
+                "Read distribution"
+            })
+            .with_x_label(if compact_labels {
+                ""
+            } else {
+                "Region / metric"
+            })
+            .with_y_label(if compact_labels { "" } else { "Share (%)" }),
+    ];
+
+    let read_layout = std::mem::replace(&mut layouts[3], Layout::auto_from_plots(&plots[3]))
+        .with_y_axis_min(0.0)
+        .with_y_axis_max(100.0)
+        .with_y_tick_format(TickFormat::Fixed(0));
+    layouts[3] = read_layout;
+
+    if include_raw_profile {
+        plots.insert(2, vec![Plot::Line(raw_three_prime_plot)]);
+        layouts.insert(
+            2,
+            Layout::auto_from_plots(&plots[2])
+                .with_title(if compact_labels {
+                    "Raw 3'"
+                } else {
+                    "Raw 3' profile"
+                })
+                .with_x_label(if compact_labels {
+                    ""
+                } else {
+                    "Distance from 3' end (bp)"
+                })
+                .with_y_label(if compact_labels { "" } else { "Raw counts" }),
+        );
+    }
+
+    if include_raw_profile {
+        plots.push(vec![Plot::Bar(qc_plot)]);
+        layouts.push(
+            Layout::auto_from_plots(plots.last().unwrap())
+                .with_title("QC fractions")
+                .with_x_label("")
+                .with_y_label(""),
+        );
+    }
+
+    let rows = if include_raw_profile { 2 } else { 2 };
+    let cols = if include_raw_profile { 3 } else { 2 };
+    let mut figure = Figure::new(rows, cols)
+        .with_plots(plots)
+        .with_layouts(layouts);
+    if !compact_labels {
+        figure = figure.with_labels();
+    }
+    figure = figure.with_title(format!("RNA QC summary for {}", sample_name));
+    figure
+}
+
+fn category_bar_plot(categories: Vec<(&str, f64, &str)>) -> BarPlot {
+    let mut plot = BarPlot::new();
+    for (label, value, color) in categories {
+        plot = plot.with_group(label, vec![(value, color)]);
+    }
+    plot
+}
+
+fn percent_from_counts(count: u64, total: f64) -> f64 {
+    if total <= 0.0 {
+        0.0
+    } else {
+        (count as f64 * 100.0 / total).clamp(0.0, 100.0)
+    }
+}
+
+fn percent_from_fraction(fraction: f64) -> f64 {
+    (fraction * 100.0).clamp(0.0, 100.0)
+}
+
+fn stranded_reverse_percent(qc: &RnaSeqQcSummary) -> f64 {
+    let stranded_total = qc.stranded_forward_count + qc.stranded_reverse_count;
+    if stranded_total == 0 {
+        0.0
+    } else {
+        percent_from_counts(qc.stranded_reverse_count as u64, stranded_total as f64)
+    }
 }

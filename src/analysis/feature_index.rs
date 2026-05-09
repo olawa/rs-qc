@@ -1,5 +1,6 @@
 use crate::analysis::read_distribution::RegionType;
 use crate::io::annotation::ParsedTranscript;
+use crate::models::normalize_chrom;
 use crate::models::Exon;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -57,7 +58,7 @@ impl FeatureIndex {
         let mut chrom_transcripts: HashMap<String, Vec<&ParsedTranscript>> = HashMap::new();
         for tx in transcripts {
             chrom_transcripts
-                .entry(tx.chrom.clone())
+                .entry(normalize_chrom(&tx.chrom).into_owned())
                 .or_default()
                 .push(tx);
         }
@@ -384,7 +385,8 @@ mod tests {
             Some(350),
         );
         let idx = FeatureIndex::build(&[tx]);
-        let chrom = idx.chroms.get("chr1").unwrap();
+        assert!(!idx.chroms.contains_key("chr1"));
+        let chrom = idx.chroms.get("1").unwrap();
         let mut cursor = chrom.cursor_at(0);
 
         assert_eq!(chrom.classify(110, &mut cursor), RegionType::Utr5Exon);

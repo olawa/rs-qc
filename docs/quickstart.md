@@ -62,6 +62,12 @@ Useful options:
 - `--qc-sample-size` for strandedness and inner-distance sampling
 - `--rdna-bed` for explicit rDNA interval annotation
 - `--rdna-contigs` for contig-name-based rDNA detection
+- `--snap-qc` to render marker-gene snapshots for RNA QC
+- `--snap-genes` to add custom snapshot genes such as `GAPDH,ACTB,MALAT1`
+- `--snap-flank` and `--snap-max-reads` to tune snapshot windows and density
+
+RNA output now includes a compact terminal summary, per-sample `*.rna.qc_summary.svg`,
+and optional `*.rna_snapshots.tsv` plus a snapshot directory.
 
 ## Snapshot
 
@@ -115,6 +121,9 @@ Useful inputs:
 - an output prefix like `sample_fastq`
 - a summary JSON path like `sample.fastq.summary.json`
 - a mix of module prefixes and summary JSON files
+
+RNA report sections embed the combined QC summary figure and link any snapshots
+that were generated for the sample.
 
 ## Planned Modules
 

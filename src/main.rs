@@ -276,6 +276,14 @@ struct RnaArgs {
     #[arg(long, default_value_t = false)]
     no_plot: bool,
     #[arg(long, default_value_t = false)]
+    snap_qc: bool,
+    #[arg(long, value_delimiter = ',')]
+    snap_genes: Vec<String>,
+    #[arg(long, default_value_t = 500)]
+    snap_flank: u64,
+    #[arg(long, default_value_t = 500)]
+    snap_max_reads: usize,
+    #[arg(long, default_value_t = false)]
     r2_only: bool,
     #[arg(long, default_value = "protein_coding")]
     biotype: String,
@@ -365,6 +373,10 @@ fn run_rna_wrapper(args: RnaArgs) -> Result<()> {
         max_3p_dist: args.max_3p_dist,
         min_support: args.min_support,
         no_plot: args.no_plot,
+        snap_qc: args.snap_qc,
+        snap_genes: args.snap_genes,
+        snap_flank: args.snap_flank,
+        snap_max_reads: args.snap_max_reads,
         r2_only: args.r2_only,
         biotype: args.biotype,
         save_index: args.save_index,

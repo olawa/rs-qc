@@ -130,6 +130,15 @@ pub fn resolve_snapshot_region(
     annotation_path: Option<&str>,
     annotation_format: AnnotationFormat,
 ) -> Result<GenomicRegion> {
+    resolve_snapshot_region_with_flank(raw_region, annotation_path, annotation_format, None)
+}
+
+pub fn resolve_snapshot_region_with_flank(
+    raw_region: &str,
+    annotation_path: Option<&str>,
+    annotation_format: AnnotationFormat,
+    flank_bp: Option<u64>,
+) -> Result<GenomicRegion> {
     if let Ok(region) = parse_region(raw_region) {
         return Ok(region);
     }
@@ -139,7 +148,7 @@ pub fn resolve_snapshot_region(
     };
 
     lookup_gene_region(path, raw_region, annotation_format)
-        .map(pad_gene_region)
+        .map(|coords| pad_gene_region(coords, flank_bp))
         .ok_or_else(|| anyhow!("invalid region or gene not found: {raw_region}"))
 }
 
@@ -183,13 +192,18 @@ pub fn parse_region(raw: &str) -> Result<GenomicRegion> {
     }
 }
 
-fn pad_gene_region((chrom, start, end): (String, i64, i64)) -> GenomicRegion {
-    let span = (end - start).abs().max(1);
-    let padding = (span / 8).clamp(200, 5_000);
+fn pad_gene_region(
+    (chrom, start, end): (String, i64, i64),
+    flank_bp: Option<u64>,
+) -> GenomicRegion {
+    let padding = flank_bp.map(|v| v as i64).unwrap_or_else(|| {
+        let span = (end - start).abs().max(1);
+        (span / 8).clamp(200, 5_000)
+    });
     GenomicRegion {
         chrom,
         start: (start - padding).max(1) as u64,
-        end: (end + padding) as u64,
+        end: (end + padding).max(start + 1) as u64,
     }
 }
 

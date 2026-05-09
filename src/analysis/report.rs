@@ -190,6 +190,12 @@ fn render_html(document: &ReportDocument) -> String {
         .meta{display:flex; gap:12px; flex-wrap:wrap; color:#5a6475; font-size:.92rem; margin:10px 0 12px 0;}\
         .links{display:flex; gap:10px; flex-wrap:wrap; margin:10px 0 14px 0;}\
         .links a{display:inline-block; text-decoration:none; color:#1d4ed8; background:#eff6ff; border:1px solid #dbeafe; border-radius:10px; padding:6px 10px; font-size:.9rem;}\
+        .figure{margin:14px 0 16px 0;}\
+        .figure img{display:block; width:100%; height:auto; border:1px solid #e2e7f0; border-radius:12px; background:#fff;}\
+        .snapshots{display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:10px; margin:14px 0 0 0;}\
+        .snapshot{border:1px solid #e2e7f0; border-radius:12px; padding:10px 12px; background:#f8fbff;}\
+        .snapshot a{color:#1d4ed8; text-decoration:none; font-weight:700;}\
+        .snapshot .meta{margin:6px 0 0 0; font-size:.84rem; color:#64748b;}\
         table{width:100%; border-collapse:collapse; font-size:.94rem;}\
         td{padding:6px 8px; border-top:1px solid #edf1f7; vertical-align:top;}\
         td.key{font-weight:600; width:34%; color:#243047;}\
@@ -239,6 +245,17 @@ fn render_html(document: &ReportDocument) -> String {
             }
             out.push_str("</div>");
         }
+        if section.module == "rna" {
+            if let Some((href, alt)) = rna_summary_figure_link(section) {
+                out.push_str("<div class=\"figure\">");
+                out.push_str(&format!(
+                    "<img src=\"{}\" alt=\"{}\">",
+                    escape_html(&href),
+                    escape_html(&alt)
+                ));
+                out.push_str("</div>");
+            }
+        }
         out.push_str("<table><tbody>");
         for (key, value) in flatten_summary(&section.metrics, "") {
             out.push_str(&format!(
@@ -248,6 +265,24 @@ fn render_html(document: &ReportDocument) -> String {
             ));
         }
         out.push_str("</tbody></table>");
+        if section.module == "rna" {
+            if let Some(items) = rna_snapshot_items(section) {
+                if !items.is_empty() {
+                    out.push_str("<div class=\"snapshots\">");
+                    for (label, href, meta) in items {
+                        out.push_str("<div class=\"snapshot\">");
+                        out.push_str(&format!(
+                            "<a href=\"{}\">{}</a>",
+                            escape_html(&href),
+                            escape_html(&label)
+                        ));
+                        out.push_str(&format!("<div class=\"meta\">{}</div>", escape_html(&meta)));
+                        out.push_str("</div>");
+                    }
+                    out.push_str("</div>");
+                }
+            }
+        }
         out.push_str("<details><summary>Raw JSON</summary><pre>");
         out.push_str(&escape_html(
             &serde_json::to_string_pretty(&section.metrics).unwrap_or_else(|_| "{}".to_string()),
@@ -308,6 +343,8 @@ fn artifact_links(section: &ReportSection) -> Vec<(String, String)> {
             format!("{prefix}.inner_distance.tsv"),
             format!("{prefix}.geneBodyCoverage.txt"),
             format!("{prefix}.geneBodyCoverage.svg"),
+            format!("{prefix}.rna.qc_summary.svg"),
+            format!("{prefix}.rna_snapshots.tsv"),
         ],
         _ => Vec::new(),
     };
@@ -323,6 +360,42 @@ fn artifact_links(section: &ReportSection) -> Vec<(String, String)> {
             }
         })
         .collect()
+}
+
+fn rna_summary_figure_link(section: &ReportSection) -> Option<(String, String)> {
+    let source = Path::new(&section.source);
+    let prefix = summary_prefix_from_path(source)?;
+    let dir = source.parent().unwrap_or_else(|| Path::new("."));
+    let name = format!("{prefix}.{}.rna.qc_summary.svg", section.sample);
+    let path = dir.join(&name);
+    if path.exists() {
+        Some((name, format!("RNA QC summary for {}", section.sample)))
+    } else {
+        None
+    }
+}
+
+fn rna_snapshot_items(section: &ReportSection) -> Option<Vec<(String, String, String)>> {
+    let source = Path::new(&section.source);
+    let prefix = summary_prefix_from_path(source)?;
+    let dir = source.parent().unwrap_or_else(|| Path::new("."));
+    let manifest = dir.join(format!("{prefix}.{}.rna_snapshots.tsv", section.sample));
+    let raw = fs::read_to_string(manifest).ok()?;
+    let mut items = Vec::new();
+    for line in raw.lines().skip(1) {
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() < 7 {
+            continue;
+        }
+        let gene = cols[0].to_string();
+        let snapshot_path = cols[5].to_string();
+        let reason = cols[6].to_string();
+        if snapshot_path.is_empty() {
+            continue;
+        }
+        items.push((gene, snapshot_path, reason));
+    }
+    Some(items)
 }
 
 fn summary_prefix_from_path(path: &Path) -> Option<String> {
