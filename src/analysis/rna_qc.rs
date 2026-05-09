@@ -153,65 +153,25 @@ pub fn run_rna(config: RnaQcConfig) -> Result<()> {
 
         let finalize_start = Instant::now();
         let bai_path = crate::analysis::bam_scan::find_bai_path(bam_path);
-        let mut total_state = if let (Some(bp), DenseMapScope::Chunk | DenseMapScope::Chrom) =
-            (&bai_path, config.dense_map_scope)
-        {
-            let mut state = state::RnaWorkerState::new(config.qc_sample_size);
-            let chunk_size = if config.dense_map_scope == DenseMapScope::Chrom {
-                u64::MAX
-            } else {
-                config.dense_map_chunk_size
-            };
-
-            println!(
-                "  - DenseMap scope: {:?}, chunk size: {} bp",
-                config.dense_map_scope, chunk_size
-            );
-
-            let all_windows = crate::analysis::bam_scan::generate_windows(&header, 10_000_000);
-            let pb = ProgressBar::new(all_windows.len() as u64);
-            pb.set_style(indicatif::ProgressStyle::default_bar().template(
-                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} Windows ({eta})",
-            )?);
-
-            for (name, seq) in header.reference_sequences() {
-                let chrom = String::from_utf8_lossy(name.as_ref()).to_string();
-                let chrom_norm = normalize_chrom(&chrom).into_owned();
-                let chrom_len = seq.length().get() as u64;
-
-                let (start, end) = coverage_index_ref
-                    .chrom_spans
-                    .get(&chrom_norm)
-                    .cloned()
-                    .unwrap_or((0, chrom_len));
-
-                let mut chunk_start = start;
-                while chunk_start < end {
-                    let chunk_end = (chunk_start + chunk_size).min(end);
-                    let dense = coverage_index_ref.build_dense_map_for_range(
-                        &chrom,
-                        chunk_start,
-                        chunk_end,
+        let mut total_state = if let (Some(bp), scope) = (&bai_path, config.dense_map_scope) {
+            match scope {
+                DenseMapScope::Window => {
+                    println!(
+                        "  - DenseMap scope: Window, window size: {} bp",
+                        config.window_size
                     );
+                    let windows =
+                        crate::analysis::bam_scan::generate_windows(&header, config.window_size);
+                    let pb = ProgressBar::new(windows.len() as u64);
+                    pb.set_style(indicatif::ProgressStyle::default_bar().template(
+                        "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} Windows ({eta})",
+                    )?);
 
-                    let mut dense_maps = HashMap::new();
-                    if let Some(d) = dense {
-                        dense_maps.insert(chrom_norm.clone(), Arc::new(d));
-                    }
-
-                    let windows = crate::analysis::bam_scan::generate_windows_for_range(
-                        &chrom,
-                        &chrom_norm,
-                        chunk_start,
-                        chunk_end,
-                        10_000_000,
-                    );
-
-                    let chunk_state = scan::scan_windows_with_pb(
+                    let res = scan::scan_windows_with_pb(
                         &scan::ScanContext {
                             bam_path,
                             header: &header,
-                            dense_maps: &dense_maps,
+                            dense_maps: &HashMap::new(),
                             coverage_index: coverage_index_ref,
                             feature_index: feature_index.as_deref(),
                             rdna_contigs: rdna_contigs.as_ref(),
@@ -223,13 +183,101 @@ pub fn run_rna(config: RnaQcConfig) -> Result<()> {
                         &windows,
                         Some(pb.clone()),
                     )?;
+                    pb.finish_and_clear();
+                    res
+                }
+                DenseMapScope::Chunk | DenseMapScope::Chrom => {
+                    let mut state = state::RnaWorkerState::new(config.qc_sample_size);
+                    let chunk_size = if config.dense_map_scope == DenseMapScope::Chrom {
+                        u64::MAX
+                    } else {
+                        config.dense_map_chunk_size
+                    };
 
-                    state = state.merge(chunk_state);
-                    chunk_start = chunk_end;
+                    println!(
+                        "  - DenseMap scope: {:?}, chunk size: {} bp",
+                        config.dense_map_scope, chunk_size
+                    );
+
+                    let all_windows =
+                        crate::analysis::bam_scan::generate_windows(&header, config.window_size);
+                    let pb = ProgressBar::new(all_windows.len() as u64);
+                    pb.set_style(indicatif::ProgressStyle::default_bar().template(
+                        "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} Windows ({eta})",
+                    )?);
+
+                    for (name, seq) in header.reference_sequences() {
+                        let chrom = String::from_utf8_lossy(name.as_ref()).to_string();
+                        let chrom_norm = normalize_chrom(&chrom).into_owned();
+                        let chrom_len = seq.length().get() as u64;
+
+                        let (start, end) = coverage_index_ref
+                            .chrom_spans
+                            .get(&chrom_norm)
+                            .cloned()
+                            .unwrap_or((0, chrom_len));
+
+                        let mut chunk_start = start;
+                        while chunk_start < end {
+                            let chunk_end = (chunk_start + chunk_size).min(end);
+                            let dense = coverage_index_ref.build_dense_map_for_range(
+                                &chrom,
+                                chunk_start,
+                                chunk_end,
+                            );
+
+                            let mut dense_maps = HashMap::new();
+                            if let Some(d) = dense {
+                                dense_maps.insert(chrom_norm.clone(), Arc::new(d));
+                            }
+
+                            let windows = crate::analysis::bam_scan::generate_windows_for_range(
+                                &chrom,
+                                &chrom_norm,
+                                chunk_start,
+                                chunk_end,
+                                config.window_size,
+                            );
+
+                            let chunk_state = scan::scan_windows_with_pb(
+                                &scan::ScanContext {
+                                    bam_path,
+                                    header: &header,
+                                    dense_maps: &dense_maps,
+                                    coverage_index: coverage_index_ref,
+                                    feature_index: feature_index.as_deref(),
+                                    rdna_contigs: rdna_contigs.as_ref(),
+                                    rdna_intervals: rdna_intervals.as_deref(),
+                                    config: &config,
+                                    threads,
+                                },
+                                bp,
+                                &windows,
+                                Some(pb.clone()),
+                            )?;
+
+                            state = state.merge(chunk_state);
+                            chunk_start = chunk_end;
+                        }
+                    }
+                    pb.finish_and_clear();
+                    state
+                }
+                DenseMapScope::All => {
+                    let dense_maps = build_all_dense_maps(coverage_index_ref, &config)?;
+                    scan::scan_bam_coverage(&scan::ScanContext {
+                        bam_path,
+                        header: &header,
+                        dense_maps: &dense_maps,
+                        coverage_index: coverage_index_ref,
+                        feature_index: feature_index.as_deref(),
+                        rdna_contigs: rdna_contigs.as_ref(),
+                        rdna_intervals: rdna_intervals.as_deref(),
+                        config: &config,
+                        threads,
+                    })?
                 }
             }
-            pb.finish_and_clear();
-            state
         } else {
             // Fallback to All mode if no BAI or explicitly requested
             if bai_path.is_none() && config.dense_map_scope != DenseMapScope::All {

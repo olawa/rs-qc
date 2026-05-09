@@ -336,12 +336,15 @@ struct RnaArgs {
     /// Number of concurrent threads for dense map construction (reduces peak memory).
     #[arg(long, default_value_t = 1)]
     pub dense_map_workers: usize,
-    /// Strategy for building dense maps (all, chrom, or chunk). Chunk is recommended for low memory.
-    #[arg(long, value_enum, default_value_t = crate::analysis::rna_qc::DenseMapScope::Chunk)]
+    /// Strategy for building dense maps (all, chrom, chunk, or window). Window is recommended for performance and low memory.
+    #[arg(long, value_enum, default_value_t = crate::analysis::rna_qc::DenseMapScope::Window)]
     pub dense_map_scope: crate::analysis::rna_qc::DenseMapScope,
     /// Size of genomic chunks for dense map construction in 'chunk' mode.
     #[arg(long, default_value_t = 50_000_000)]
     pub dense_map_chunk_size: u64,
+    /// Size of genomic windows for BAM scanning. In 'window' mode, this is also the indexing granularity.
+    #[arg(long, default_value_t = 10_000_000)]
+    pub window_size: usize,
 }
 
 fn main() -> Result<()> {
@@ -414,6 +417,7 @@ fn run_rna_wrapper(args: RnaArgs) -> Result<()> {
         dense_map_workers: args.dense_map_workers,
         dense_map_scope: args.dense_map_scope,
         dense_map_chunk_size: args.dense_map_chunk_size,
+        window_size: args.window_size,
     };
     run_rna(config)
 }

@@ -7,8 +7,9 @@ use serde::{Deserialize, Serialize};
 pub enum DenseMapScope {
     All,
     Chrom,
-    #[default]
     Chunk,
+    #[default]
+    Window,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -56,4 +57,5 @@ pub struct RnaQcConfig {
     pub dense_map_workers: usize,
     pub dense_map_scope: DenseMapScope,
     pub dense_map_chunk_size: u64,
+    pub window_size: usize,
 }

@@ -8,7 +8,7 @@ use crate::analysis::types::AnalysisType;
 use crate::io::bam::{alignment_start_0, for_each_aligned_block, match_span, reference_span};
 use crate::models::{is_autosomal_chrom, normalize_chrom};
 use anyhow::{Context, Result};
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{ProgressBar, ProgressStyle};
 use noodles::bam;
 use noodles::sam;
 use rayon::prelude::*;
@@ -69,7 +69,7 @@ pub(crate) struct ScanContext<'a> {
 pub(crate) fn scan_bam_coverage(ctx: &ScanContext<'_>) -> Result<RnaWorkerState> {
     if let Some(bai_path) = find_bai_path(ctx.bam_path) {
         println!("  - BAI Index found. Using high-performance parallel dense scan.");
-        let windows = generate_windows(ctx.header, 10_000_000);
+        let windows = generate_windows(ctx.header, ctx.config.window_size);
         let pb = ProgressBar::new(windows.len() as u64);
         pb.set_style(ProgressStyle::default_bar().template(
             "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} Windows ({eta})",
@@ -81,14 +81,6 @@ pub(crate) fn scan_bam_coverage(ctx: &ScanContext<'_>) -> Result<RnaWorkerState>
         println!("  - No BAI Index found. Falling back to sequential single-threaded scan.");
         scan_sequential_bam(ctx)
     }
-}
-
-pub(crate) fn scan_windows(
-    ctx: &ScanContext<'_>,
-    bai_path: &str,
-    windows: &[crate::analysis::bam_scan::BamWindow],
-) -> Result<RnaWorkerState> {
-    scan_indexed_bam(ctx, bai_path, windows, None)
 }
 
 pub(crate) fn scan_windows_with_pb(
@@ -140,7 +132,26 @@ fn scan_indexed_bam(
                     }
 
                     let reader = &mut opt.as_mut().unwrap().1;
-                    scan_indexed_window(ctx, reader, window, &mut state)
+
+                    let mut local_dense_maps = std::collections::HashMap::new();
+                    if ctx.config.dense_map_scope == super::config::DenseMapScope::Window {
+                        if let Some(dense) = ctx.coverage_index.build_dense_map_for_range(
+                            &window.chrom,
+                            window.start as u64,
+                            window.end as u64,
+                        ) {
+                            local_dense_maps.insert(window.chrom_norm.clone(), Arc::new(dense));
+                        }
+                    }
+
+                    let dense_maps_to_use =
+                        if ctx.config.dense_map_scope == super::config::DenseMapScope::Window {
+                            &local_dense_maps
+                        } else {
+                            ctx.dense_maps
+                        };
+
+                    scan_indexed_window(ctx, reader, window, &mut state, dense_maps_to_use)
                 });
                 window_res?;
                 if let Some(pb) = &pb {
@@ -164,10 +175,11 @@ fn scan_indexed_window(
     reader: &mut bam::io::IndexedReader<noodles::bgzf::Reader<File>>,
     window: &crate::analysis::bam_scan::BamWindow,
     state: &mut RnaWorkerState,
+    dense_maps: &std::collections::HashMap<String, Arc<DenseMap>>,
 ) -> Result<()> {
     let chrom = &window.chrom;
     let chrom_norm = &window.chrom_norm;
-    let maybe_dense = ctx.dense_maps.get(chrom_norm);
+    let maybe_dense = dense_maps.get(chrom_norm);
     let maybe_feature = ctx
         .feature_index
         .and_then(|index| index.chroms.get(chrom_norm));
