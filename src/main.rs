@@ -333,6 +333,15 @@ struct RnaArgs {
     pub three_prime_max_ratio: f64,
     #[arg(long, default_value_t = false)]
     pub write_counts: bool,
+    /// Number of concurrent threads for dense map construction (reduces peak memory).
+    #[arg(long, default_value_t = 1)]
+    pub dense_map_workers: usize,
+    /// Strategy for building dense maps (all, chrom, or chunk). Chunk is recommended for low memory.
+    #[arg(long, value_enum, default_value_t = crate::analysis::rna_qc::DenseMapScope::Chunk)]
+    pub dense_map_scope: crate::analysis::rna_qc::DenseMapScope,
+    /// Size of genomic chunks for dense map construction in 'chunk' mode.
+    #[arg(long, default_value_t = 50_000_000)]
+    pub dense_map_chunk_size: u64,
 }
 
 fn main() -> Result<()> {
@@ -402,6 +411,9 @@ fn run_rna_wrapper(args: RnaArgs) -> Result<()> {
         three_prime_min_anchor_nonzero_bins: args.three_prime_min_anchor_nonzero_bins,
         three_prime_max_ratio: args.three_prime_max_ratio,
         write_counts: args.write_counts,
+        dense_map_workers: args.dense_map_workers,
+        dense_map_scope: args.dense_map_scope,
+        dense_map_chunk_size: args.dense_map_chunk_size,
     };
     run_rna(config)
 }

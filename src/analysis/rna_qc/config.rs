@@ -1,5 +1,15 @@
 use crate::analysis::types::AnalysisType;
 use crate::io::annotation::IsoformSelect;
+use clap::ValueEnum;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default, Serialize, Deserialize)]
+pub enum DenseMapScope {
+    All,
+    Chrom,
+    #[default]
+    Chunk,
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct RnaQcConfig {
@@ -43,4 +53,7 @@ pub struct RnaQcConfig {
     pub three_prime_min_anchor_nonzero_bins: usize,
     pub three_prime_max_ratio: f64,
     pub write_counts: bool,
+    pub dense_map_workers: usize,
+    pub dense_map_scope: DenseMapScope,
+    pub dense_map_chunk_size: u64,
 }

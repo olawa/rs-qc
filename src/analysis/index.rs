@@ -90,32 +90,47 @@ impl AnnotationIndex {
     pub fn build_dense_map(&self, chrom: &str) -> Option<DenseMap> {
         let chrom_norm = normalize_chrom(chrom);
         let (start, end) = self.chrom_spans.get(chrom_norm.as_ref())?;
-        let len = (end - start) as usize;
+        self.build_dense_map_for_range(chrom, *start, *end)
+    }
 
+    pub fn build_dense_map_for_range(
+        &self,
+        chrom: &str,
+        range_start: u64,
+        range_end: u64,
+    ) -> Option<DenseMap> {
+        let chrom_norm = normalize_chrom(chrom);
         let gene_indices = self.genes_by_chrom.get(chrom_norm.as_ref())?;
+        let len = (range_end - range_start) as usize;
 
         // Stage 1: Single array to track hits.
-        let mut map_base = vec![0u32; len];
+        let mut map = vec![0u32; len];
         let mut multi_map_temp: HashMap<usize, Vec<u32>> = HashMap::new();
 
         for &i in gene_indices {
             let gene = &self.genes[i];
             let g_idx = i as u32;
             let g_offset = gene.bin_map.offset;
+            let g_len = gene.bin_map.bins.len() as u64;
+
+            // Fast skip if gene is entirely outside the requested range
+            if g_offset + g_len <= range_start || g_offset >= range_end {
+                continue;
+            }
 
             for (local_pos, &s_pos) in gene.bin_map.bins.iter().enumerate() {
                 if s_pos != u32::MAX {
                     let global_pos = g_offset + local_pos as u64;
-                    if global_pos >= *start && global_pos < *end {
-                        let idx = (global_pos - *start) as usize;
-                        let current = map_base[idx];
+                    if global_pos >= range_start && global_pos < range_end {
+                        let idx = (global_pos - range_start) as usize;
+                        let current = map[idx];
                         if current == 0 {
-                            map_base[idx] = g_idx + 1;
+                            map[idx] = g_idx + 1;
                         } else if current == u32::MAX {
                             multi_map_temp.get_mut(&idx).unwrap().push(g_idx);
                         } else {
                             let prev_g_idx = current - 1;
-                            map_base[idx] = u32::MAX;
+                            map[idx] = u32::MAX;
                             multi_map_temp.insert(idx, vec![prev_g_idx, g_idx]);
                         }
                     }
@@ -128,9 +143,6 @@ impl AnnotationIndex {
         let mut multi_offsets = Vec::new();
         multi_offsets.push(0u32);
 
-        let mut map = vec![0u32; len];
-        let mut pos_to_m_idx: HashMap<usize, u32> = HashMap::new();
-
         // Sort positions to ensure stable multi_map indexing and potentially better locality
         let mut multi_positions: Vec<_> = multi_map_temp.keys().cloned().collect();
         multi_positions.sort_unstable();
@@ -140,19 +152,11 @@ impl AnnotationIndex {
             let m_idx = (multi_offsets.len() - 1) as u32;
             multi_data.extend_from_slice(hits);
             multi_offsets.push(multi_data.len() as u32);
-            pos_to_m_idx.insert(idx, m_idx | 0x80000000);
-        }
-
-        for (idx, val) in map_base.iter().enumerate() {
-            if *val == u32::MAX {
-                map[idx] = *pos_to_m_idx.get(&idx).unwrap();
-            } else {
-                map[idx] = *val;
-            }
+            map[idx] = m_idx | 0x80000000;
         }
 
         Some(DenseMap {
-            offset: *start,
+            offset: range_start,
             map,
             multi_data,
             multi_offsets,
@@ -203,6 +207,15 @@ impl AnnotationIndex {
 
         Ok(index)
     }
+    pub fn estimate_dense_map_memory(&self) -> u64 {
+        let mut total_bytes = 0;
+        for (start, end) in self.chrom_spans.values() {
+            let len = (end - start) as u64;
+            // map_base (4 bytes) + final map (4 bytes).
+            total_bytes += len * 8;
+        }
+        total_bytes
+    }
 }
 
 impl DenseMap {
@@ -226,6 +239,93 @@ impl DenseMap {
             let start = self.multi_offsets[m_idx] as usize;
             let end = self.multi_offsets[m_idx + 1] as usize;
             Hits::Multi(&self.multi_data[start..end])
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::Gene;
+    use crate::models::gene::GeneBinMap;
+
+    #[test]
+    fn test_build_dense_map_for_range() {
+        use crate::models::Transcript;
+        let mut gene1 = Gene {
+            id: "g1".to_string(),
+            name: None,
+            chrom: "chr1".to_string(),
+            biotype: None,
+            total_len: 5,
+            representative: Transcript {
+                chrom: "chr1".to_string(),
+                ..Transcript::default()
+            },
+            bin_map: Arc::new(GeneBinMap {
+                offset: 100,
+                bins: vec![0, 1, 2, 3, 4],
+            }),
+            counts_3p: Arc::new(Vec::new()),
+            counts_percentile: Arc::new(Vec::new()),
+        };
+
+        let mut gene2 = Gene {
+            id: "g2".to_string(),
+            name: None,
+            chrom: "chr1".to_string(),
+            biotype: None,
+            total_len: 5,
+            representative: Transcript {
+                chrom: "chr1".to_string(),
+                ..Transcript::default()
+            },
+            bin_map: Arc::new(GeneBinMap {
+                offset: 103,
+                bins: vec![0, 1, 2, 3, 4],
+            }),
+            counts_3p: Arc::new(Vec::new()),
+            counts_percentile: Arc::new(Vec::new()),
+        };
+
+        let index = AnnotationIndex::new(vec![gene1, gene2], false);
+
+        // Test range fully containing both
+        let dense = index.build_dense_map_for_range("chr1", 90, 110).unwrap();
+        assert_eq!(dense.offset, 90);
+        assert_eq!(dense.map.len(), 20);
+
+        // pos 100 (idx 10): gene1 only
+        match dense.get_hits(100) {
+            Hits::Single(0) => {}
+            _ => panic!("Expected single hit for gene1 at 100"),
+        }
+
+        // pos 104 (idx 14): gene1 and gene2
+        match dense.get_hits(104) {
+            Hits::Multi(hits) => {
+                assert_eq!(hits.len(), 2);
+                assert!(hits.contains(&0));
+                assert!(hits.contains(&1));
+            }
+            _ => panic!("Expected multi hit at 104"),
+        }
+
+        // pos 107 (idx 17): gene2 only
+        match dense.get_hits(107) {
+            Hits::Single(1) => {}
+            _ => panic!("Expected single hit for gene2 at 107"),
+        }
+
+        // Test range clipping
+        let dense_clipped = index.build_dense_map_for_range("chr1", 104, 106).unwrap();
+        assert_eq!(dense_clipped.offset, 104);
+        assert_eq!(dense_clipped.map.len(), 2);
+        
+        // pos 104 in clipped map (idx 0)
+        match dense_clipped.get_hits(104) {
+            Hits::Multi(_) => {}
+            _ => panic!("Expected multi hit at 104 in clipped map"),
         }
     }
 }

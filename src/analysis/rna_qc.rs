@@ -14,15 +14,17 @@ use crate::io::annotation::{load_annotation, load_genes, AnnotationConfig, Annot
 use crate::io::bam::alignment_start_0;
 use crate::models::{normalize_chrom, Gene};
 use crate::stats::plotting::PlotMetadata;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use noodles::bam;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use indicatif::ProgressBar;
+use rayon::prelude::*;
 use std::time::Instant;
 
-pub use config::RnaQcConfig;
+pub use config::{DenseMapScope, RnaQcConfig};
 
 pub fn run_rna(config: RnaQcConfig) -> Result<()> {
     let threads = normalize_thread_count(config.threads);
@@ -149,57 +151,110 @@ pub fn run_rna(config: RnaQcConfig) -> Result<()> {
             reader.read_header()?
         };
 
-        println!(
-            "  - Pre-calculating metadata and dense mappings for {} chromosomes...",
-            coverage_index_ref.chrom_spans.len()
-        );
-        use rayon::prelude::*;
-        let dense_maps: HashMap<String, Arc<DenseMap>> = coverage_index_ref
-            .chrom_spans
-            .keys()
-            .collect::<Vec<_>>()
-            .into_par_iter()
-            .filter_map(|chrom| {
-                coverage_index_ref
-                    .build_dense_map(chrom)
-                    .map(|dense| (chrom.to_string(), Arc::new(dense)))
-            })
-            .fold(
-                || HashMap::new(),
-                |mut d_acc, (chrom, dense)| {
-                    d_acc.insert(chrom, dense);
-                    d_acc
-                },
-            )
-            .reduce(
-                || HashMap::new(),
-                |mut d1, d2| {
-                    d1.extend(d2);
-                    d1
-                },
+        let finalize_start = Instant::now();
+        let bai_path = crate::analysis::bam_scan::find_bai_path(bam_path);
+        let mut total_state = if let (Some(bp), DenseMapScope::Chunk | DenseMapScope::Chrom) =
+            (&bai_path, config.dense_map_scope)
+        {
+            let mut state = state::RnaWorkerState::new(config.qc_sample_size);
+            let chunk_size = if config.dense_map_scope == DenseMapScope::Chrom {
+                u64::MAX
+            } else {
+                config.dense_map_chunk_size
+            };
+
+            println!(
+                "  - DenseMap scope: {:?}, chunk size: {} bp",
+                config.dense_map_scope, chunk_size
             );
 
-        let dense_maps = Arc::new(dense_maps);
+            let all_windows = crate::analysis::bam_scan::generate_windows(&header, 10_000_000);
+            let pb = ProgressBar::new(all_windows.len() as u64);
+            pb.set_style(indicatif::ProgressStyle::default_bar().template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} Windows ({eta})",
+            )?);
 
-        let finalize_start = Instant::now();
-        let mut total_state = scan::scan_bam_coverage(&scan::ScanContext {
-            bam_path,
-            header: &header,
-            dense_maps: dense_maps.as_ref(),
-            coverage_index: coverage_index_ref,
-            feature_index: feature_index.as_deref(),
-            rdna_contigs: rdna_contigs.as_ref(),
-            rdna_intervals: rdna_intervals.as_deref(),
-            config: &config,
-            threads,
-        })?;
+            for (name, seq) in header.reference_sequences() {
+                let chrom = String::from_utf8_lossy(name.as_ref()).to_string();
+                let chrom_norm = normalize_chrom(&chrom).into_owned();
+                let chrom_len = seq.length().get() as u64;
+
+                let (start, end) = coverage_index_ref
+                    .chrom_spans
+                    .get(&chrom_norm)
+                    .cloned()
+                    .unwrap_or((0, chrom_len));
+
+                let mut chunk_start = start;
+                while chunk_start < end {
+                    let chunk_end = (chunk_start + chunk_size).min(end);
+                    let dense = coverage_index_ref.build_dense_map_for_range(
+                        &chrom,
+                        chunk_start,
+                        chunk_end,
+                    );
+
+                    let mut dense_maps = HashMap::new();
+                    if let Some(d) = dense {
+                        dense_maps.insert(chrom_norm.clone(), Arc::new(d));
+                    }
+
+                    let windows = crate::analysis::bam_scan::generate_windows_for_range(
+                        &chrom,
+                        &chrom_norm,
+                        chunk_start,
+                        chunk_end,
+                        10_000_000,
+                    );
+
+                    let chunk_state = scan::scan_windows_with_pb(
+                        &scan::ScanContext {
+                            bam_path,
+                            header: &header,
+                            dense_maps: &dense_maps,
+                            coverage_index: coverage_index_ref,
+                            feature_index: feature_index.as_deref(),
+                            rdna_contigs: rdna_contigs.as_ref(),
+                            rdna_intervals: rdna_intervals.as_deref(),
+                            config: &config,
+                            threads,
+                        },
+                        bp,
+                        &windows,
+                        Some(pb.clone()),
+                    )?;
+
+                    state = state.merge(chunk_state);
+                    chunk_start = chunk_end;
+                }
+            }
+            pb.finish_and_clear();
+            state
+        } else {
+            // Fallback to All mode if no BAI or explicitly requested
+            if bai_path.is_none() && config.dense_map_scope != DenseMapScope::All {
+                println!("  - Warning: No BAI index found. Falling back to 'All' DenseMap scope for sequential scan.");
+            }
+
+            let dense_maps = build_all_dense_maps(coverage_index_ref, &config)?;
+            scan::scan_bam_coverage(&scan::ScanContext {
+                bam_path,
+                header: &header,
+                dense_maps: &dense_maps,
+                coverage_index: coverage_index_ref,
+                feature_index: feature_index.as_deref(),
+                rdna_contigs: rdna_contigs.as_ref(),
+                rdna_intervals: rdna_intervals.as_deref(),
+                config: &config,
+                threads,
+            })?
+        };
 
         if config.analysis.contains(&AnalysisType::Qc) {
             let qc_start = Instant::now();
             total_state.qc = scan_inline_qc_sample(
                 bam_path,
                 &header,
-                dense_maps.as_ref(),
                 coverage_index_ref,
                 &config,
             )?;
@@ -394,6 +449,51 @@ fn normalize_thread_count(threads: usize) -> usize {
     scan::normalize_thread_count(threads)
 }
 
+fn build_all_dense_maps(
+    index: &AnnotationIndex,
+    config: &RnaQcConfig,
+) -> Result<HashMap<String, Arc<DenseMap>>> {
+    let memory_estimate_bytes = index.estimate_dense_map_memory();
+    println!(
+        "  - Pre-calculating all dense mappings (est. peak memory: {:.2} GB)...",
+        memory_estimate_bytes as f64 / 1_073_741_824.0
+    );
+
+    let index_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(config.dense_map_workers.max(1))
+        .build()
+        .with_context(|| "failed to create index thread pool")?;
+
+    let dense_maps: HashMap<String, Arc<DenseMap>> = index_pool.install(|| {
+        index
+            .chrom_spans
+            .keys()
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .filter_map(|chrom| {
+                index
+                    .build_dense_map(chrom)
+                    .map(|dense| (chrom.to_string(), Arc::new(dense)))
+            })
+            .fold(
+                || HashMap::new(),
+                |mut d_acc, (chrom, dense)| {
+                    d_acc.insert(chrom, dense);
+                    d_acc
+                },
+            )
+            .reduce(
+                || HashMap::new(),
+                |mut d1, d2| {
+                    d1.extend(d2);
+                    d1
+                },
+            )
+    });
+
+    Ok(dense_maps)
+}
+
 #[cfg(test)]
 fn window_owns_record_start(pos: u64, win_start: u64, win_end: u64) -> bool {
     scan::window_owns_record_start(pos, win_start, win_end)
@@ -402,7 +502,6 @@ fn window_owns_record_start(pos: u64, win_start: u64, win_end: u64) -> bool {
 fn scan_inline_qc_sample(
     bam_path: &str,
     header: &noodles::sam::Header,
-    dense_maps: &HashMap<String, Arc<DenseMap>>,
     index: &AnnotationIndex,
     config: &RnaQcConfig,
 ) -> Result<InlineQcState> {
@@ -422,6 +521,8 @@ fn scan_inline_qc_sample(
             (chrom, chrom_norm)
         })
         .collect();
+
+    let mut current_dense: Option<(String, Arc<DenseMap>)> = None;
 
     for result in reader.records() {
         if !qc.needs_more() {
@@ -453,10 +554,21 @@ fn scan_inline_qc_sample(
         let Some((chrom, chrom_norm)) = ref_metadata.get(id) else {
             continue;
         };
-        let Some(dense) = dense_maps.get(chrom_norm) else {
-            continue;
-        };
 
+        // On-demand DenseMap building
+        if current_dense
+            .as_ref()
+            .map(|(c, _)| c != chrom_norm)
+            .unwrap_or(true)
+        {
+            if let Some(dense) = index.build_dense_map(chrom) {
+                current_dense = Some((chrom_norm.clone(), Arc::new(dense)));
+            } else {
+                continue;
+            }
+        }
+
+        let dense = &current_dense.as_ref().unwrap().1;
         maybe_observe_inline_qc(&mut qc, &record, chrom, dense, &index.genes, 0, u64::MAX);
     }
 

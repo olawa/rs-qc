@@ -42,6 +42,29 @@ pub fn generate_windows(header: &sam::Header, chunk_size: usize) -> Vec<BamWindo
     windows
 }
 
+pub fn generate_windows_for_range(
+    chrom: &str,
+    chrom_norm: &str,
+    start: u64,
+    end: u64,
+    window_size: usize,
+) -> Vec<BamWindow> {
+    let mut windows = Vec::new();
+    let mut curr = start as u32;
+    let end_u32 = end as u32;
+    while curr < end_u32 {
+        let win_end = (curr + window_size as u32).min(end_u32);
+        windows.push(BamWindow {
+            chrom: chrom.to_string(),
+            chrom_norm: chrom_norm.to_string(),
+            start: curr,
+            end: win_end,
+        });
+        curr = win_end;
+    }
+    windows
+}
+
 pub fn find_bai_path(bam_path: &str) -> Option<String> {
     if Path::new(&format!("{bam_path}.bai")).exists() {
         Some(format!("{bam_path}.bai"))

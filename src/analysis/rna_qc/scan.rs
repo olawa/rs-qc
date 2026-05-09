@@ -69,22 +69,44 @@ pub(crate) struct ScanContext<'a> {
 pub(crate) fn scan_bam_coverage(ctx: &ScanContext<'_>) -> Result<RnaWorkerState> {
     if let Some(bai_path) = find_bai_path(ctx.bam_path) {
         println!("  - BAI Index found. Using high-performance parallel dense scan.");
-        scan_indexed_bam(ctx, &bai_path)
+        let windows = generate_windows(ctx.header, 10_000_000);
+        let pb = ProgressBar::new(windows.len() as u64);
+        pb.set_style(ProgressStyle::default_bar().template(
+            "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} Windows ({eta})",
+        )?);
+        let res = scan_windows_with_pb(ctx, &bai_path, &windows, Some(pb.clone()));
+        pb.finish_and_clear();
+        res
     } else {
         println!("  - No BAI Index found. Falling back to sequential single-threaded scan.");
         scan_sequential_bam(ctx)
     }
 }
 
-fn scan_indexed_bam(ctx: &ScanContext<'_>, bai_path: &str) -> Result<RnaWorkerState> {
-    let bai = bam::bai::read(bai_path)?;
-    let windows = generate_windows(ctx.header, 10_000_000);
+pub(crate) fn scan_windows(
+    ctx: &ScanContext<'_>,
+    bai_path: &str,
+    windows: &[crate::analysis::bam_scan::BamWindow],
+) -> Result<RnaWorkerState> {
+    scan_indexed_bam(ctx, bai_path, windows, None)
+}
 
-    let m_pb = MultiProgress::new();
-    let pb = m_pb.add(ProgressBar::new(windows.len() as u64));
-    pb.set_style(ProgressStyle::default_bar().template(
-        "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} Windows ({eta})",
-    )?);
+pub(crate) fn scan_windows_with_pb(
+    ctx: &ScanContext<'_>,
+    bai_path: &str,
+    windows: &[crate::analysis::bam_scan::BamWindow],
+    pb: Option<ProgressBar>,
+) -> Result<RnaWorkerState> {
+    scan_indexed_bam(ctx, bai_path, windows, pb)
+}
+
+fn scan_indexed_bam(
+    ctx: &ScanContext<'_>,
+    bai_path: &str,
+    windows: &[crate::analysis::bam_scan::BamWindow],
+    pb: Option<ProgressBar>,
+) -> Result<RnaWorkerState> {
+    let bai = bam::bai::read(bai_path)?;
 
     let bai_arc = Arc::new(bai);
     let qc_sample_size = ctx.config.qc_sample_size.div_ceil(ctx.threads);
@@ -121,7 +143,9 @@ fn scan_indexed_bam(ctx: &ScanContext<'_>, bai_path: &str) -> Result<RnaWorkerSt
                     scan_indexed_window(ctx, reader, window, &mut state)
                 });
                 window_res?;
-                pb.inc(1);
+                if let Some(pb) = &pb {
+                    pb.inc(1);
+                }
                 Ok(state)
             },
         )
