@@ -41,6 +41,26 @@ pub struct InsertSizeMetrics {
     pub large_fragment_count: u64,
 }
 
+#[derive(Clone, Debug, Default, Serialize, PartialEq)]
+pub struct CycleMetrics {
+    pub base_count: u64,
+    pub quality_sum: u64,
+    pub a_count: u64,
+    pub c_count: u64,
+    pub g_count: u64,
+    pub t_count: u64,
+    pub n_count: u64,
+    pub mismatch_count: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, PartialEq)]
+pub struct ReadQcMetrics {
+    pub read1_cycles: BTreeMap<u32, CycleMetrics>,
+    pub read2_cycles: BTreeMap<u32, CycleMetrics>,
+    pub quality_histogram: BTreeMap<u8, u64>,
+    pub substitution_matrix: BTreeMap<String, u64>,
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct AlignmentQcMetrics {
     pub total_records: u64,
@@ -68,6 +88,7 @@ pub struct AlignmentQcMetrics {
     pub per_contig: BTreeMap<String, ContigAlignmentMetrics>,
     pub accuracy: AccuracyMetrics,
     pub insert_size_metrics: Option<InsertSizeMetrics>,
+    pub read_qc: Option<ReadQcMetrics>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -132,7 +153,6 @@ impl AccuracyMetrics {
         *self.accuracy_hist.entry(bin).or_insert(0) += 1;
     }
 }
-
 impl AlignmentQcMetrics {
     fn observe_record(
         &mut self,
@@ -142,6 +162,9 @@ impl AlignmentQcMetrics {
         ref_names: &ReferenceNames,
     ) {
         self.total_records += 1;
+
+        let read_qc = self.read_qc.get_or_insert_with(ReadQcMetrics::default);
+        observe_read_qc(read_qc, record);
 
         let flags = record.flags();
         if flags.is_unmapped() {
@@ -332,6 +355,9 @@ fn write_outputs(config: &AlignmentQcConfig, metrics: &AlignmentQcMetrics) -> Re
     write_accuracy_hist(config, metrics)?;
     if let Some(ref m) = metrics.insert_size_metrics {
         write_insert_size_metrics(config, m)?;
+    }
+    if let Some(ref rqc) = metrics.read_qc {
+        write_read_qc_outputs(config, rqc)?;
     }
     write_summary_json(
         &format!("{}.align.summary.json", config.output_prefix),
@@ -648,6 +674,297 @@ pub fn sample_name_from_alignment_path(path: &str) -> String {
         .to_string()
 }
 
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+enum MdElement {
+    Match(u32),
+    Mismatch(char),
+    Deletion(String),
+}
+
+fn parse_md_tag(md_str: &str) -> Vec<MdElement> {
+    let mut elements = Vec::new();
+    let mut chars = md_str.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if c.is_ascii_digit() {
+            let mut num_str = String::new();
+            while let Some(&d) = chars.peek() {
+                if d.is_ascii_digit() {
+                    num_str.push(chars.next().unwrap());
+                } else {
+                    break;
+                }
+            }
+            if let Ok(num) = num_str.parse::<u32>() {
+                elements.push(MdElement::Match(num));
+            }
+        } else if c == '^' {
+            chars.next(); // Consume '^'
+            let mut deleted = String::new();
+            while let Some(&d) = chars.peek() {
+                if d.is_ascii_alphabetic() {
+                    deleted.push(chars.next().unwrap());
+                } else {
+                    break;
+                }
+            }
+            elements.push(MdElement::Deletion(deleted));
+        } else if c.is_ascii_alphabetic() {
+            elements.push(MdElement::Mismatch(chars.next().unwrap()));
+        } else {
+            chars.next(); // Consume unexpected character
+        }
+    }
+    elements
+}
+
+fn observe_read_qc(
+    read_qc: &mut ReadQcMetrics,
+    record: &bam::Record,
+) {
+    let bases: Vec<u8> = record.sequence().iter().collect();
+    let qualities = record.quality_scores().as_ref().to_vec();
+    let len = bases.len();
+    if len == 0 {
+        return;
+    }
+
+    let flags = record.flags();
+    let is_read2 = flags.is_last_segment();
+
+    // 1. Quality Histogram
+    for &q in &qualities {
+        *read_qc.quality_histogram.entry(q).or_insert(0) += 1;
+    }
+
+    // 2. MD Tag Parsing if available
+    let md_tag_value = record.data().get(&Tag::new(b'M', b'D')).and_then(|res| {
+        res.ok().and_then(|val| match val {
+            Value::String(s) => Some(s.to_string()),
+            _ => None,
+        })
+    });
+
+    let mut mismatch_positions = vec![false; len];
+    let mut substitutions = Vec::new();
+
+    if let Some(md_str) = md_tag_value {
+        let md_elements = parse_md_tag(&md_str);
+        let mut query_pos = 0_usize;
+        let mut md_iter = md_elements.into_iter();
+        let mut current_md = md_iter.next();
+        let mut md_match_left = 0;
+
+        for op_res in record.cigar().iter() {
+            if let Ok(op) = op_res {
+                let op_len = op.len();
+                let kind = op.kind();
+
+                match kind {
+                    Kind::SoftClip | Kind::Insertion => {
+                        query_pos += op_len;
+                    }
+                    Kind::Deletion => {
+                        if let Some(MdElement::Deletion(_)) = current_md {
+                            current_md = md_iter.next();
+                        }
+                    }
+                    Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
+                        for _ in 0..op_len {
+                            if query_pos >= len {
+                                break;
+                            }
+
+                            loop {
+                                match &current_md {
+                                    Some(MdElement::Match(n)) => {
+                                        if md_match_left == 0 {
+                                            md_match_left = *n;
+                                        }
+                                        if md_match_left > 0 {
+                                            md_match_left -= 1;
+                                            if md_match_left == 0 {
+                                                current_md = md_iter.next();
+                                            }
+                                            break;
+                                        } else {
+                                            current_md = md_iter.next();
+                                        }
+                                    }
+                                    Some(MdElement::Mismatch(ref_char)) => {
+                                        let ref_char = ref_char.to_ascii_uppercase();
+                                        let query_base = bases[query_pos] as char;
+                                        let query_base = query_base.to_ascii_uppercase();
+                                        mismatch_positions[query_pos] = true;
+                                        substitutions.push(format!("{}->{}", ref_char, query_base));
+                                        current_md = md_iter.next();
+                                        break;
+                                    }
+                                    Some(MdElement::Deletion(_)) => {
+                                        current_md = md_iter.next();
+                                    }
+                                    None => break,
+                                }
+                            }
+                            query_pos += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    } else {
+        let mut query_pos = 0_usize;
+        for op_res in record.cigar().iter() {
+            if let Ok(op) = op_res {
+                let op_len = op.len();
+                let kind = op.kind();
+                match kind {
+                    Kind::SoftClip | Kind::Insertion => {
+                        query_pos += op_len;
+                    }
+                    Kind::SequenceMismatch => {
+                        for _ in 0..op_len {
+                            if query_pos < len {
+                                mismatch_positions[query_pos] = true;
+                            }
+                            query_pos += 1;
+                        }
+                    }
+                    Kind::Match | Kind::SequenceMatch => {
+                        query_pos += op_len;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // 3. Populate Cycle Metrics
+    let cycle_map = if is_read2 {
+        &mut read_qc.read2_cycles
+    } else {
+        &mut read_qc.read1_cycles
+    };
+
+    for (pos, &b) in bases.iter().enumerate() {
+        let cycle = (pos + 1) as u32;
+        let q = qualities.get(pos).copied().unwrap_or(0);
+
+        let entry = cycle_map.entry(cycle).or_default();
+        entry.base_count += 1;
+        entry.quality_sum += q as u64;
+
+        match b.to_ascii_uppercase() {
+            b'A' => entry.a_count += 1,
+            b'C' => entry.c_count += 1,
+            b'G' => entry.g_count += 1,
+            b'T' => entry.t_count += 1,
+            _ => entry.n_count += 1,
+        }
+
+        if pos < len && mismatch_positions[pos] {
+            entry.mismatch_count += 1;
+        }
+    }
+
+    // 4. Record substitutions
+    for sub in substitutions {
+        *read_qc.substitution_matrix.entry(sub).or_insert(0) += 1;
+    }
+}
+
+fn write_read_qc_outputs(config: &AlignmentQcConfig, metrics: &ReadQcMetrics) -> Result<()> {
+    {
+        let mut out = File::create(format!("{}.align.read_qc.cycles.tsv", config.output_prefix))?;
+        writeln!(
+            out,
+            "read_type\tcycle\tbase_count\tmean_quality\tA_pct\tC_pct\tG_pct\tT_pct\tN_pct\tmismatch_rate"
+        )?;
+
+        let mut write_cycles = |read_type: &str, cycles: &BTreeMap<u32, CycleMetrics>| -> Result<()> {
+            for (&cycle, cycle_metrics) in cycles {
+                let count = cycle_metrics.base_count;
+                if count == 0 {
+                    continue;
+                }
+                let mean_q = cycle_metrics.quality_sum as f64 / count as f64;
+                let pct = |c: u64| (c as f64 * 100.0) / count as f64;
+                let mismatch_rate = cycle_metrics.mismatch_count as f64 / count as f64;
+                writeln!(
+                    out,
+                    "{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.6}",
+                    read_type,
+                    cycle,
+                    count,
+                    mean_q,
+                    pct(cycle_metrics.a_count),
+                    pct(cycle_metrics.c_count),
+                    pct(cycle_metrics.g_count),
+                    pct(cycle_metrics.t_count),
+                    pct(cycle_metrics.n_count),
+                    mismatch_rate
+                )?;
+            }
+            Ok(())
+        };
+
+        write_cycles("read1", &metrics.read1_cycles)?;
+        write_cycles("read2", &metrics.read2_cycles)?;
+    }
+
+    {
+        let mut out = File::create(format!("{}.align.read_qc.substitutions.tsv", config.output_prefix))?;
+        writeln!(out, "substitution\tcount")?;
+        for (sub, count) in &metrics.substitution_matrix {
+            writeln!(out, "{}\t{}", sub, count)?;
+        }
+    }
+
+    {
+        let mut out = File::create(format!("{}.align.read_qc.qualities.tsv", config.output_prefix))?;
+        writeln!(out, "quality\tcount")?;
+        for (q, count) in &metrics.quality_histogram {
+            writeln!(out, "{}\t{}", q, count)?;
+        }
+    }
+
+    Ok(())
+}
+
+impl ReadQcMetrics {
+    pub fn merge(&mut self, other: ReadQcMetrics) {
+        for (cycle, metrics) in other.read1_cycles {
+            let entry = self.read1_cycles.entry(cycle).or_default();
+            entry.base_count += metrics.base_count;
+            entry.quality_sum += metrics.quality_sum;
+            entry.a_count += metrics.a_count;
+            entry.c_count += metrics.c_count;
+            entry.g_count += metrics.g_count;
+            entry.t_count += metrics.t_count;
+            entry.n_count += metrics.n_count;
+            entry.mismatch_count += metrics.mismatch_count;
+        }
+        for (cycle, metrics) in other.read2_cycles {
+            let entry = self.read2_cycles.entry(cycle).or_default();
+            entry.base_count += metrics.base_count;
+            entry.quality_sum += metrics.quality_sum;
+            entry.a_count += metrics.a_count;
+            entry.c_count += metrics.c_count;
+            entry.g_count += metrics.g_count;
+            entry.t_count += metrics.t_count;
+            entry.n_count += metrics.n_count;
+            entry.mismatch_count += metrics.mismatch_count;
+        }
+        for (q, count) in other.quality_histogram {
+            *self.quality_histogram.entry(q).or_insert(0) += count;
+        }
+        for (sub, count) in other.substitution_matrix {
+            *self.substitution_matrix.entry(sub).or_insert(0) += count;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -726,5 +1043,66 @@ mod tests {
         // ratios
         assert!((res.cfdna_ratio.unwrap() - 20.0 / 390.0).abs() < 1e-6); // 20 / 390
         assert!((res.mono_di_ratio.unwrap() - 390.0 / 150.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_parse_md_tag() {
+        let md = "10A5^AC2G1";
+        let parsed = parse_md_tag(md);
+        assert_eq!(parsed.len(), 7);
+        match &parsed[0] {
+            MdElement::Match(n) => assert_eq!(*n, 10),
+            _ => panic!("Expected Match"),
+        }
+        match &parsed[1] {
+            MdElement::Mismatch(c) => assert_eq!(*c, 'A'),
+            _ => panic!("Expected Mismatch"),
+        }
+        match &parsed[2] {
+            MdElement::Match(n) => assert_eq!(*n, 5),
+            _ => panic!("Expected Match"),
+        }
+        match &parsed[3] {
+            MdElement::Deletion(s) => assert_eq!(s, "AC"),
+            _ => panic!("Expected Deletion"),
+        }
+        match &parsed[4] {
+            MdElement::Match(n) => assert_eq!(*n, 2),
+            _ => panic!("Expected Match"),
+        }
+        match &parsed[5] {
+            MdElement::Mismatch(c) => assert_eq!(*c, 'G'),
+            _ => panic!("Expected Mismatch"),
+        }
+        match &parsed[6] {
+            MdElement::Match(n) => assert_eq!(*n, 1),
+            _ => panic!("Expected Match"),
+        }
+    }
+
+    #[test]
+    fn test_read_qc_merging() {
+        let mut r1 = ReadQcMetrics::default();
+        let mut entry1 = CycleMetrics::default();
+        entry1.base_count = 10;
+        entry1.quality_sum = 300;
+        entry1.a_count = 5;
+        entry1.mismatch_count = 1;
+        r1.read1_cycles.insert(1, entry1);
+
+        let mut r2 = ReadQcMetrics::default();
+        let mut entry2 = CycleMetrics::default();
+        entry2.base_count = 20;
+        entry2.quality_sum = 600;
+        entry2.a_count = 15;
+        entry2.mismatch_count = 2;
+        r2.read1_cycles.insert(1, entry2);
+
+        r1.merge(r2);
+        let merged = r1.read1_cycles.get(&1).unwrap();
+        assert_eq!(merged.base_count, 30);
+        assert_eq!(merged.quality_sum, 900);
+        assert_eq!(merged.a_count, 20);
+        assert_eq!(merged.mismatch_count, 3);
     }
 }
