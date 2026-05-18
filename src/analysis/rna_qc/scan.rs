@@ -102,7 +102,7 @@ fn scan_indexed_bam(
 
     let bai_arc = Arc::new(bai);
     let qc_sample_size = ctx.config.qc_sample_size.div_ceil(ctx.threads);
-    let empty_state = || RnaWorkerState::new(qc_sample_size);
+    let empty_state = || RnaWorkerState::new(ctx.config, qc_sample_size);
 
     windows
         .par_iter()
@@ -319,7 +319,7 @@ fn scan_indexed_window(
 fn scan_sequential_bam(ctx: &ScanContext<'_>) -> Result<RnaWorkerState> {
     let file = File::open(ctx.bam_path)?;
     let mut reader = bam::io::Reader::new(file);
-    let mut state = RnaWorkerState::new(ctx.config.qc_sample_size);
+    let mut state = RnaWorkerState::new(ctx.config, ctx.config.qc_sample_size);
 
     let ref_metadata: Vec<_> = ctx
         .header

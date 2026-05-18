@@ -88,12 +88,13 @@ pub fn generate_stratified_gene_body_plot(
 ) -> Result<()> {
     // Fixed colour per length class — must match the labels in aggregate_rseqc_stratified.
     let colour_map: &[(&str, &str)] = &[
-        ("short (<1.5kb)", "#2196F3"),    // blue
-        ("medium (1.5-5kb)", "#009688"),  // teal
-        ("long (5-10kb)", "#FF9800"),     // orange
-        ("very long (>10kb)", "#F44336"), // red
+        ("2-5kb", "#2196F3"),    // blue
+        ("5-10kb", "#009688"),   // teal
+        ("10-20kb", "#FF9800"),  // orange
+        ("20kb+", "#F44336"),    // red
+        ("all", "#333333"),      // dark grey
     ];
-    let fallback_colour = "#9E9E9E"; // grey for unexpected keys
+    let fallback_colour = "#9E9E9E";
 
     // Preserve biological order rather than alphabetical sort.
     let ordered_keys: Vec<&str> = colour_map
@@ -375,47 +376,61 @@ fn build_rna_qc_summary_figure(
     stats: &crate::stats::AggregatedStats,
     qc: &RnaSeqQcSummary,
     read_dist_counts: &[u64; 12],
-    include_raw_profile: bool,
+    _include_raw_profile: bool,
     compact_labels: bool,
 ) -> Figure {
-    let gene_body_max = stats
-        .percentile_means
-        .iter()
-        .fold(0.0_f64, |acc, &v| acc.max(v))
-        .max(0.001);
-    let gene_body_plot = LinePlot::new()
-        .with_data(
-            stats
-                .percentile_means
-                .iter()
-                .enumerate()
-                .map(|(i, &v)| (i as f64 + 1.0, (v / gene_body_max) * 100.0)),
-        )
-        .with_color("steelblue")
-        .with_stroke_width(2.0);
+    let mut gene_body_plots = Vec::new();
+    let overall_max = stats.percentile_means.iter().fold(0.0f64, |acc, &v| acc.max(v)).max(0.001);
 
-    let three_prime_plot = LinePlot::new()
-        .with_data(
-            stats
-                .dist_3p_means
-                .iter()
-                .enumerate()
-                .map(|(i, &v)| (i as f64 * stats.bin_size as f64, v)),
-        )
-        .with_color("darkorange")
-        .with_stroke_width(2.0);
-
-    let mut three_prime_plots = vec![Plot::Line(three_prime_plot)];
-    for &x in &[5000.0, 10000.0] {
-        three_prime_plots.push(
-            LinePlot::new()
-                .with_data(vec![(x, 0.0), (x, 1.5)])
-                .with_color("#aaa")
-                .with_line_style(LineStyle::Dashed)
-                .with_stroke_width(1.0)
-                .into(),
-        );
+    if !stats.stratified.is_empty() {
+        for (&stratum, s_stats) in &stats.stratified {
+            let color = match stratum {
+                crate::stats::LengthStratum::B2_5kb => "#2196F3",
+                crate::stats::LengthStratum::B5_10kb => "#009688",
+                crate::stats::LengthStratum::B10_20kb => "#FF9800",
+                crate::stats::LengthStratum::B20kbPlus => "#F44336",
+                _ => "#888",
+            };
+            let s_max = s_stats.percentile_normalized.iter().fold(0.0f64, |acc, &v| acc.max(v)).max(0.001);
+            gene_body_plots.push(Plot::Line(LinePlot::new()
+                .with_data(s_stats.percentile_normalized.iter().enumerate().map(|(i, &v)| (i as f64 + 1.0, (v / s_max) * 100.0)))
+                .with_color(color)
+                .with_stroke_width(1.5)
+                .with_legend(stratum.as_str().to_string())));
+        }
     }
+    
+    gene_body_plots.push(Plot::Line(LinePlot::new()
+        .with_data(stats.percentile_means.iter().enumerate().map(|(i, &v)| (i as f64 + 1.0, (v / overall_max) * 100.0)))
+        .with_color("#333")
+        .with_stroke_width(2.5)
+        .with_legend("all".to_string())));
+
+    let mut three_prime_plots = Vec::new();
+    if !stats.stratified.is_empty() {
+        for (&stratum, s_stats) in &stats.stratified {
+            let color = match stratum {
+                crate::stats::LengthStratum::B2_5kb => "#2196F3",
+                crate::stats::LengthStratum::B5_10kb => "#009688",
+                crate::stats::LengthStratum::B10_20kb => "#FF9800",
+                crate::stats::LengthStratum::B20kbPlus => "#F44336",
+                _ => "#888",
+            };
+            three_prime_plots.push(Plot::Line(LinePlot::new()
+                .with_data(s_stats.dist_3p_means.iter().enumerate().map(|(i, &v)| (i as f64 * stats.bin_size as f64, v)))
+                .with_color(color)
+                .with_stroke_width(1.5)
+                .with_legend(stratum.as_str().to_string())));
+        }
+    }
+
+    three_prime_plot_guides(&mut three_prime_plots);
+
+    three_prime_plots.push(Plot::Line(LinePlot::new()
+        .with_data(stats.dist_3p_means.iter().enumerate().map(|(i, &v)| (i as f64 * stats.bin_size as f64, v)))
+        .with_color("#333")
+        .with_stroke_width(2.5)
+        .with_legend("all".to_string())));
 
     let raw_three_prime_plot = LinePlot::new()
         .with_data(
@@ -487,18 +502,21 @@ fn build_rna_qc_summary_figure(
         ("Other", qc.other_fraction() * 100.0, "#edc948"),
     ]);
 
-    let mut plots: Vec<Vec<Plot>> = vec![
-        vec![Plot::Line(gene_body_plot)],
+    let plots = vec![
+        gene_body_plots,
         three_prime_plots,
+        vec![Plot::Line(raw_three_prime_plot)],
         vec![Plot::Line(inner_distance_plot)],
         vec![Plot::Bar(read_distribution_plot)],
+        vec![Plot::Bar(qc_plot)],
     ];
-    let mut layouts = vec![
+
+    let layouts = vec![
         Layout::auto_from_plots(&plots[0])
             .with_title(if compact_labels {
                 "Gene body"
             } else {
-                "Gene body"
+                "Gene body coverage"
             })
             .with_x_label(if compact_labels {
                 ""
@@ -527,6 +545,10 @@ fn build_rna_qc_summary_figure(
                 "Normalized coverage"
             }),
         Layout::auto_from_plots(&plots[2])
+            .with_title("Raw 3' profile")
+            .with_x_label("Distance (bp)")
+            .with_y_label("Counts"),
+        Layout::auto_from_plots(&plots[3])
             .with_title(if compact_labels {
                 "Inner dist"
             } else {
@@ -534,57 +556,26 @@ fn build_rna_qc_summary_figure(
             })
             .with_x_label(if compact_labels { "" } else { "bp" })
             .with_y_label(if compact_labels { "" } else { "Count" }),
-        Layout::auto_from_plots(&plots[3])
+        Layout::auto_from_plots(&plots[4])
             .with_title(if compact_labels {
                 "Read dist"
             } else {
                 "Read distribution"
             })
-            .with_x_label(if compact_labels {
-                ""
-            } else {
-                "Region / metric"
-            })
-            .with_y_label(if compact_labels { "" } else { "Share (%)" }),
+            .with_x_label("")
+            .with_y_label("Share (%)")
+            .with_y_axis_min(0.0)
+            .with_y_axis_max(100.0),
+        Layout::auto_from_plots(&plots[5])
+            .with_title("Orientation summary")
+            .with_x_label("")
+            .with_y_label("Share (%)")
+            .with_y_axis_min(0.0)
+            .with_y_axis_max(100.0),
     ];
 
-    let read_layout = std::mem::replace(&mut layouts[3], Layout::auto_from_plots(&plots[3]))
-        .with_y_axis_min(0.0)
-        .with_y_axis_max(100.0)
-        .with_y_tick_format(TickFormat::Fixed(0));
-    layouts[3] = read_layout;
-
-    if include_raw_profile {
-        plots.insert(2, vec![Plot::Line(raw_three_prime_plot)]);
-        layouts.insert(
-            2,
-            Layout::auto_from_plots(&plots[2])
-                .with_title(if compact_labels {
-                    "Raw 3'"
-                } else {
-                    "Raw 3' profile"
-                })
-                .with_x_label(if compact_labels {
-                    ""
-                } else {
-                    "Distance from 3' end (bp)"
-                })
-                .with_y_label(if compact_labels { "" } else { "Raw counts" }),
-        );
-    }
-
-    if include_raw_profile {
-        plots.push(vec![Plot::Bar(qc_plot)]);
-        layouts.push(
-            Layout::auto_from_plots(plots.last().unwrap())
-                .with_title("QC fractions")
-                .with_x_label("")
-                .with_y_label(""),
-        );
-    }
-
-    let rows = if include_raw_profile { 2 } else { 2 };
-    let cols = if include_raw_profile { 3 } else { 2 };
+    let rows = 2;
+    let cols = 3;
     let mut figure = Figure::new(rows, cols)
         .with_plots(plots)
         .with_layouts(layouts);
@@ -593,6 +584,19 @@ fn build_rna_qc_summary_figure(
     }
     figure = figure.with_title(format!("RNA QC summary for {}", sample_name));
     figure
+}
+
+fn three_prime_plot_guides(plots: &mut Vec<Plot>) {
+    for &x in &[5000.0, 10000.0] {
+        plots.push(
+            LinePlot::new()
+                .with_data(vec![(x, 0.0), (x, 1.5)])
+                .with_color("#aaa")
+                .with_line_style(LineStyle::Dashed)
+                .with_stroke_width(1.0)
+                .into(),
+        );
+    }
 }
 
 fn category_bar_plot(categories: Vec<(&str, f64, &str)>) -> BarPlot {

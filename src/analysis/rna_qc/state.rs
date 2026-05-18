@@ -19,24 +19,26 @@ pub(crate) struct RnaWorkerState {
     pub(crate) read_dist_counts: [u64; 12],
     pub(crate) unknown_chrom_reads: u64,
     pub(crate) qc: InlineQcState,
+    pub(crate) config: super::config::RnaQcConfig,
 }
 
 impl RnaWorkerState {
-    pub(crate) fn new(qc_sample_size: usize) -> Self {
+    pub(crate) fn new(config: &super::config::RnaQcConfig, qc_sample_size: usize) -> Self {
         Self {
             records_seen: 0,
             fail_unmapped: 0,
             fail_secondary: 0,
             fail_qc: 0,
             fail_mapq: 0,
-            overlaps_found: 0,
             total_tags: 0,
+            overlaps_found: 0,
             aligned_qc_reads: 0,
             mtdna_reads: 0,
             rdna_reads: 0,
             read_dist_counts: [0; 12],
             unknown_chrom_reads: 0,
             qc: InlineQcState::new(qc_sample_size),
+            config: config.clone(),
         }
     }
 

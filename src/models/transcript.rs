@@ -16,6 +16,7 @@ pub struct Transcript {
     pub total_length: u64,
     pub cds_start: Option<u64>, // Genomic 0-based
     pub cds_end: Option<u64>,   // Genomic 0-based, half-open
+    pub cluster_size: usize,
 }
 
 #[allow(dead_code)]
@@ -40,7 +41,13 @@ impl Transcript {
             total_length,
             cds_start,
             cds_end,
+            cluster_size: 1,
         }
+    }
+
+    pub fn with_cluster_size(mut self, cluster_size: usize) -> Self {
+        self.cluster_size = cluster_size;
+        self
     }
 
     /// Returns the 5' terminal genomic coordinate.

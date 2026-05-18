@@ -195,6 +195,8 @@ pub enum IsoformSelectMode {
     Longest,
     Shortest,
     Median,
+    Common3p,
+    Canonical,
 }
 
 #[derive(ClapArgs, Debug)]
@@ -297,7 +299,7 @@ struct RnaArgs {
     transcript_centric: bool,
     #[arg(long, default_value_t = false)]
     plus: bool,
-    #[arg(long, value_enum, default_value = "longest")]
+    #[arg(long, value_enum, default_value = "common3p")]
     isoform_select: IsoformSelectMode,
     #[arg(long, default_value_t = false)]
     coverage_weighted: bool,
@@ -403,6 +405,8 @@ fn run_rna_wrapper(args: RnaArgs) -> Result<()> {
             IsoformSelectMode::Longest => crate::io::annotation::IsoformSelect::Longest,
             IsoformSelectMode::Shortest => crate::io::annotation::IsoformSelect::Shortest,
             IsoformSelectMode::Median => crate::io::annotation::IsoformSelect::Median,
+            IsoformSelectMode::Common3p => crate::io::annotation::IsoformSelect::Common3p,
+            IsoformSelectMode::Canonical => crate::io::annotation::IsoformSelect::Canonical,
         },
         coverage_weighted: args.coverage_weighted,
         strict_cluster: args.strict_cluster,

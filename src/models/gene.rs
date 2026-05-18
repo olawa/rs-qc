@@ -80,6 +80,7 @@ pub struct Gene {
     pub counts_3p: Arc<Vec<AtomicU32>>,
     #[serde(skip, default = "empty_arc_vec")]
     pub counts_percentile: Arc<Vec<AtomicU32>>,
+    pub num_isoforms: usize,
 }
 
 fn empty_arc_vec<T>() -> Arc<Vec<T>> {
@@ -110,7 +111,13 @@ impl Gene {
             bin_map: Arc::new(bin_map),
             counts_3p: Arc::new((0..n_3p_bins).map(|_| AtomicU32::new(0)).collect()),
             counts_percentile: Arc::new((0..100).map(|_| AtomicU32::new(0)).collect()),
+            num_isoforms: 1,
         }
+    }
+
+    pub fn with_num_isoforms(mut self, num_isoforms: usize) -> Self {
+        self.num_isoforms = num_isoforms;
+        self
     }
 
     pub fn add_percentile(&self, idx: usize, delta: u32) {
@@ -153,6 +160,7 @@ impl Clone for Gene {
             bin_map: Arc::clone(&self.bin_map),
             counts_3p: Arc::clone(&self.counts_3p),
             counts_percentile: Arc::clone(&self.counts_percentile),
+            num_isoforms: self.num_isoforms,
         }
     }
 }

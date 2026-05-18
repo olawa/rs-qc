@@ -1,10 +1,63 @@
 pub mod plotting;
 use crate::analysis::index::AnnotationIndex;
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::sync::atomic::Ordering;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum LengthStratum {
+    All,
+    B2_5kb,
+    B5_10kb,
+    B10_20kb,
+    B20kbPlus,
+}
+
+impl LengthStratum {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::B2_5kb => "2-5kb",
+            Self::B5_10kb => "5-10kb",
+            Self::B10_20kb => "10-20kb",
+            Self::B20kbPlus => "20kb+",
+        }
+    }
+
+    pub fn all_bins() -> &'static [Self] {
+        &[
+            Self::All,
+            Self::B2_5kb,
+            Self::B5_10kb,
+            Self::B10_20kb,
+            Self::B20kbPlus,
+        ]
+    }
+}
+
+pub fn length_stratum(transcript_len: u64) -> LengthStratum {
+    if transcript_len < 2000 {
+        LengthStratum::All
+    } else if transcript_len < 5000 {
+        LengthStratum::B2_5kb
+    } else if transcript_len < 10000 {
+        LengthStratum::B5_10kb
+    } else if transcript_len < 20000 {
+        LengthStratum::B10_20kb
+    } else {
+        LengthStratum::B20kbPlus
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct StratumStats {
+    pub dist_3p_means: Vec<f64>,
+    pub percentile_normalized: Vec<f64>,
+    pub support: usize,
+}
 
 pub fn fraction(numerator: u64, denominator: u64) -> f64 {
     if denominator == 0 {
@@ -31,6 +84,7 @@ pub struct AggregatedStats {
     pub total_reads: u64,
     pub total_tags: u64,
     pub unknown_chrom_reads: u64,
+    pub stratified: HashMap<LengthStratum, StratumStats>,
     pub gene_qc: Vec<ThreePrimeGeneQc>,
 }
 
@@ -52,6 +106,9 @@ pub struct ThreePrimeGeneQc {
     pub skip_reason: Option<String>,
     pub counts_3p: Vec<u32>,
     pub counts_percentile: Vec<u32>,
+    pub isoform_select_method: String,
+    pub num_isoforms: usize,
+    pub cluster_size: usize,
 }
 
 pub struct ThreePrimeParams {
@@ -217,6 +274,9 @@ pub fn aggregate_genes(
                         .iter()
                         .map(|a| a.load(Ordering::Relaxed))
                         .collect(),
+                    isoform_select_method: format!("{:?}", state.config.isoform_select),
+                    num_isoforms: gene.num_isoforms,
+                    cluster_size: gene.representative.cluster_size,
                 });
 
                 (
@@ -255,6 +315,12 @@ pub fn aggregate_genes(
                 a
             },
         );
+
+    let stratified = if state.config.stratify_length {
+        aggregate_stratified(index, min_support, three_prime_params)
+    } else {
+        HashMap::new()
+    };
 
     let dist_3p_means: Vec<f64> = dist_3p_sums
         .into_iter()
@@ -298,7 +364,84 @@ pub fn aggregate_genes(
         total_reads: state.records_seen,
         total_tags: state.total_tags,
         unknown_chrom_reads: state.unknown_chrom_reads,
+        stratified,
         gene_qc,
+    }
+}
+
+fn aggregate_stratified(
+    index: &AnnotationIndex,
+    min_support: usize,
+    three_prime_params: &ThreePrimeParams,
+) -> HashMap<LengthStratum, StratumStats> {
+    let mut results = HashMap::new();
+    for &stratum in LengthStratum::all_bins() {
+        if stratum == LengthStratum::All {
+            continue; // We already have 'all' in the main stats, but let's re-calculate for consistency if needed
+        }
+        
+        let stratum_genes: Vec<_> = index.genes.iter().filter(|g| {
+            length_stratum(g.representative.total_length as u64) == stratum
+        }).collect();
+        
+        if stratum_genes.is_empty() {
+            continue;
+        }
+
+        // Run sub-aggregation for this stratum
+        let stats = aggregate_subset(&stratum_genes, min_support, three_prime_params);
+        results.insert(stratum, stats);
+    }
+    results
+}
+
+fn aggregate_subset(
+    genes: &[&crate::models::Gene],
+    min_support: usize,
+    params: &ThreePrimeParams,
+) -> StratumStats {
+    let n_3p_bins = (params.max_3p_dist + params.bin_size - 1) / params.bin_size;
+    let (d3p_s, d3p_sup, _, p_s, p_sup, _, active_3p, _, _) = genes.iter()
+        .fold(
+            (vec![0.0f64; n_3p_bins], vec![0usize; n_3p_bins], vec![0.0f64; n_3p_bins], vec![0.0f64; 100], vec![0usize; 100], 0usize, 0usize, vec![0.0f64; n_3p_bins], Vec::<ThreePrimeGeneQc>::new()),
+            |mut acc, gene| {
+                let total_pct_count: u32 = gene.counts_percentile.iter().map(|a| a.load(Ordering::Relaxed)).sum();
+                if total_pct_count >= min_support as u32 {
+                    acc.5 += 1;
+                    let mean_pct = (total_pct_count as f64 / 100.0).max(0.001);
+                    for (i, count_atomic) in gene.counts_percentile.iter().enumerate() {
+                        acc.3[i] += count_atomic.load(Ordering::Relaxed) as f64 / mean_pct;
+                        acc.4[i] += 1;
+                    }
+
+                    let gene_len = gene.representative.total_length;
+                    let anchor_sum: u64 = gene.counts_3p.iter().take(params.normalization_bp / params.bin_size).map(|a| a.load(Ordering::Relaxed) as u64).sum();
+                    let anchor_nonzero = gene.counts_3p.iter().take(params.normalization_bp / params.bin_size).filter(|a| a.load(Ordering::Relaxed) > 0).count();
+                    let anchor_mean = anchor_sum as f64 / (params.normalization_bp / params.bin_size).max(1) as f64;
+
+                    if gene_len >= params.normalization_bp as u64 && anchor_sum >= params.min_anchor_count && anchor_mean >= params.min_anchor_mean && anchor_nonzero >= params.min_anchor_nonzero_bins {
+                        acc.6 += 1;
+                        for i in 0..n_3p_bins {
+                            if (i * params.bin_size) as u64 >= gene_len { break; }
+                            let ratio = gene.counts_3p[i].load(Ordering::Relaxed) as f64 / anchor_mean;
+                            acc.0[i] += ratio.min(params.max_ratio);
+                            acc.1[i] += 1;
+                        }
+                    }
+                }
+                acc
+            }
+        );
+
+    let dist_3p_means = d3p_s.into_iter().enumerate().map(|(i, s)| if d3p_sup[i] > 0 { s / d3p_sup[i] as f64 } else { 0.0 }).collect();
+    let percentile_means: Vec<f64> = p_s.into_iter().enumerate().map(|(i, s)| s / p_sup[i].max(1) as f64).collect();
+    let max_p = percentile_means.iter().fold(0.0f64, |a, &b| a.max(b));
+    let percentile_normalized = if max_p > 0.0 { percentile_means.iter().map(|&v| (v / max_p) * 100.0).collect() } else { vec![0.0; 100] };
+
+    StratumStats {
+        dist_3p_means,
+        percentile_normalized,
+        support: active_3p,
     }
 }
 
@@ -587,39 +730,39 @@ pub fn write_gene_profiles_tsv(
 
     writeln!(
         writer,
-        "gene_id\tgene_name\ttranscript_id\tchrom\tstrand\tlength\tgene_body_bin_count\tanchor_3p_count\tmean_body_coverage\tanchor_mean_coverage\tused_for_3p\tskip_reason\tcounts_3p_csv\tcounts_percentile_csv"
+        "gene_id\tgene_name\ttranscript_id\tchrom\tstrand\tgene_len\tisoform_select_method\tnum_isoforms\tcluster_size\ttotal_pct_count\tanchor_mean\tmax_ratio\tused\tskip_reason\tcounts_3p_csv\tcounts_percentile_csv"
     )?;
 
-    for q in qc_data {
-        let mean_body = q.total_pct_count as f64 / 100.0;
-
+    for qc in qc_data {
         write!(
             writer,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{}\t{}",
-            q.gene_id,
-            q.gene_name.as_deref().unwrap_or("-"),
-            q.transcript_id.as_deref().unwrap_or("-"),
-            q.chrom,
-            q.strand,
-            q.gene_len,
-            q.total_pct_count,
-            q.anchor_sum,
-            mean_body,
-            q.anchor_mean,
-            q.used,
-            q.skip_reason.as_deref().unwrap_or("-")
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.2}\t{:.2}\t{}\t{}",
+            qc.gene_id,
+            qc.gene_name.as_deref().unwrap_or("NA"),
+            qc.transcript_id.as_deref().unwrap_or("NA"),
+            qc.chrom,
+            qc.strand,
+            qc.gene_len,
+            qc.isoform_select_method,
+            qc.num_isoforms,
+            qc.cluster_size,
+            qc.total_pct_count,
+            qc.anchor_mean,
+            qc.max_ratio,
+            qc.used,
+            qc.skip_reason.as_deref().unwrap_or("NA")
         )?;
 
         if !compact {
             write!(writer, "\t")?;
-            for (i, &c) in q.counts_3p.iter().enumerate() {
+            for (i, &c) in qc.counts_3p.iter().enumerate() {
                 if i > 0 {
                     write!(writer, ",")?;
                 }
                 write!(writer, "{}", c)?;
             }
             write!(writer, "\t")?;
-            for (i, &c) in q.counts_percentile.iter().enumerate() {
+            for (i, &c) in qc.counts_percentile.iter().enumerate() {
                 if i > 0 {
                     write!(writer, ",")?;
                 }
@@ -655,6 +798,76 @@ pub fn write_feature_counts_tsv(path: &str, qc_data: &[ThreePrimeGeneQc]) -> any
         )?;
     }
 
+    Ok(())
+}
+
+pub fn write_stratified_gene_body_tsv(
+    path: &str,
+    sample_name: &str,
+    stratified: &HashMap<LengthStratum, StratumStats>,
+) -> anyhow::Result<()> {
+    let mut file = File::create(path)?;
+    writeln!(
+        file,
+        "sample\tstratum\tpercentile\tmean_coverage\tmean_percent_coverage\tsupport"
+    )?;
+
+    let mut strata: Vec<_> = stratified.keys().collect();
+    strata.sort_by_key(|s| s.as_str());
+
+    for &stratum in strata {
+        let stats = stratified.get(&stratum).unwrap();
+        let max_val = stats
+            .percentile_normalized
+            .iter()
+            .fold(0.0f64, |a, &b| a.max(b))
+            .max(0.001);
+        for (i, &val) in stats.percentile_normalized.iter().enumerate() {
+            writeln!(
+                file,
+                "{}\t{}\t{}\t{:.4}\t{:.2}\t{}",
+                sample_name,
+                stratum.as_str(),
+                i + 1,
+                val,
+                (val / max_val) * 100.0,
+                stats.support
+            )?;
+        }
+    }
+    Ok(())
+}
+
+pub fn write_stratified_3p_tsv(
+    path: &str,
+    sample_name: &str,
+    bin_size: usize,
+    stratified: &HashMap<LengthStratum, StratumStats>,
+) -> anyhow::Result<()> {
+    let mut file = File::create(path)?;
+    writeln!(
+        file,
+        "sample\tstratum\tdistance_start_bp\tdistance_end_bp\tmean_normalized_coverage\tsupport"
+    )?;
+
+    let mut strata: Vec<_> = stratified.keys().collect();
+    strata.sort_by_key(|s| s.as_str());
+
+    for &stratum in strata {
+        let stats = stratified.get(&stratum).unwrap();
+        for (i, &val) in stats.dist_3p_means.iter().enumerate() {
+            writeln!(
+                file,
+                "{}\t{}\t{}\t{}\t{:.4}\t{}",
+                sample_name,
+                stratum.as_str(),
+                i * bin_size,
+                (i + 1) * bin_size,
+                val,
+                stats.support
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -796,5 +1009,51 @@ mod tests {
             .as_ref()
             .unwrap()
             .contains("low anchor sum"));
+    }
+
+    #[test]
+    fn test_length_stratum_boundaries() {
+        use super::*;
+        assert_eq!(length_stratum(1000), LengthStratum::All);
+        assert_eq!(length_stratum(2500), LengthStratum::B2_5kb);
+        assert_eq!(length_stratum(7500), LengthStratum::B5_10kb);
+        assert_eq!(length_stratum(15000), LengthStratum::B10_20kb);
+        assert_eq!(length_stratum(50000), LengthStratum::B20kbPlus);
+    }
+
+    #[test]
+    fn test_isoform_selection_priorities() {
+        use crate::io::annotation::{pick_canonical_index, ParsedTranscript};
+        use crate::models::{Exon, Transcript};
+        
+        let tx_base = Transcript::new("t".into(), "c".into(), '+', None, vec![Exon{start:0, end:100}], None, None);
+        let t1 = ParsedTranscript {
+            gene_id: "g".into(), transcript_id: "t1".into(), gene_name: None, biotype: None,
+            chrom: "c".into(), strand: '+', exons: vec![], cds_start: None, cds_end: None,
+            strategy: crate::io::annotation::IdResolutionStrategy::GtfExplicit,
+            mane_select: false, ensembl_canonical: false, appris: None, tsl: None,
+        };
+        let mut t2 = t1.clone();
+        t2.transcript_id = "t2".into();
+        
+        let eligible = vec![
+            (t1.clone(), tx_base.clone()),
+            (t2.clone(), tx_base.clone()),
+        ];
+        
+        // Default (fallback to median)
+        assert_eq!(pick_canonical_index(&eligible), 1);
+        
+        // MANE Select priority
+        let mut t1_mane = t1.clone();
+        t1_mane.mane_select = true;
+        let eligible_mane = vec![(t1_mane, tx_base.clone()), (t2.clone(), tx_base.clone())];
+        assert_eq!(pick_canonical_index(&eligible_mane), 0);
+        
+        // Ensembl Canonical priority
+        let mut t2_ens = t2.clone();
+        t2_ens.ensembl_canonical = true;
+        let eligible_ens = vec![(t1.clone(), tx_base.clone()), (t2_ens, tx_base.clone())];
+        assert_eq!(pick_canonical_index(&eligible_ens), 1);
     }
 }

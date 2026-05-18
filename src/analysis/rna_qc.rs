@@ -187,7 +187,7 @@ pub fn run_rna(config: RnaQcConfig) -> Result<()> {
                     res
                 }
                 DenseMapScope::Chunk | DenseMapScope::Chrom => {
-                    let mut state = state::RnaWorkerState::new(config.qc_sample_size);
+                    let mut state = state::RnaWorkerState::new(&config, config.qc_sample_size);
                     let chunk_size = if config.dense_map_scope == DenseMapScope::Chrom {
                         u64::MAX
                     } else {

@@ -36,6 +36,10 @@ pub struct ParsedTranscript {
     pub cds_start: Option<u64>,
     pub cds_end: Option<u64>,
     pub strategy: IdResolutionStrategy,
+    pub mane_select: bool,
+    pub ensembl_canonical: bool,
+    pub appris: Option<u8>,
+    pub tsl: Option<u8>,
 }
 
 /// Controls which representative isoform is chosen per gene in standard (non-transcript-centric) mode.
@@ -45,15 +49,17 @@ pub struct ParsedTranscript {
 /// un-expressed 3\' UTR shifts the aggregate profile toward the 5\' end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum IsoformSelect {
-    /// Longest spliced transcript (classic RSeQC behaviour; default).
-    #[default]
+    /// Longest spliced transcript (classic RSeQC behaviour).
     Longest,
-    /// Shortest qualifying transcript. Avoids long un-expressed 3\' UTRs that
-    /// artificially shift the gene-body coverage plot toward the 5\' end.
+    /// Shortest qualifying transcript. Avoids long un-expressed 3\' UTRs.
     Shortest,
     /// Transcript closest to the median length among qualifying isoforms.
-    /// A reasonable compromise between completeness and avoiding UTR artefacts.
     Median,
+    /// Transcript with the most common 3' end. Among those, picks the one with the outermost 5' end.
+    #[default]
+    Common3p,
+    /// Preferred MANE Select, then Ensembl Canonical, then APPRIS P1, then TSL 1, finally Median.
+    Canonical,
 }
 
 pub struct AnnotationConfig {
@@ -162,7 +168,8 @@ fn load_transcripts_from_gtf(
             continue;
         }
 
-        let attrs = parse_gtf_attributes(fields[8]);
+        let attrs_raw = fields[8];
+        let attrs = parse_gtf_attributes(attrs_raw);
         let gene_id = match attrs.get("gene_id") {
             Some(id) => id.clone(),
             None => {
@@ -212,6 +219,10 @@ fn load_transcripts_from_gtf(
                 cds_start: None,
                 cds_end: None,
                 strategy: IdResolutionStrategy::GtfExplicit,
+                mane_select: attrs_raw.contains("MANE_Select"),
+                ensembl_canonical: attrs_raw.contains("ensembl_canonical"),
+                appris: parse_appris(&attrs),
+                tsl: parse_tsl(&attrs),
             });
 
         let start_0based = start_1based - 1;
@@ -338,6 +349,10 @@ fn load_transcripts_from_bed12(
                 None
             },
             strategy,
+            mane_select: false,
+            ensembl_canonical: false,
+            appris: None,
+            tsl: None,
         });
     }
 
@@ -424,6 +439,8 @@ fn build_genes_from_transcripts(
                 IsoformSelect::Longest => n - 1,
                 IsoformSelect::Shortest => 0,
                 IsoformSelect::Median => n / 2,
+                IsoformSelect::Common3p => pick_common3p_index(&eligible),
+                IsoformSelect::Canonical => pick_canonical_index(&eligible),
             };
             let (target_meta, target_tx) = eligible.swap_remove(pick);
 
@@ -479,6 +496,102 @@ fn parse_gtf_attributes(attr: &str) -> HashMap<String, String> {
         }
     }
     map
+}
+
+fn parse_appris(attrs: &HashMap<String, String>) -> Option<u8> {
+    attrs.get("tag").or(attrs.get("appris")).and_then(|v| {
+        if v.contains("appris_principal_1") {
+            Some(1)
+        } else if v.contains("appris_principal_2") {
+            Some(2)
+        } else if v.contains("appris_principal_3") {
+            Some(3)
+        } else if v.contains("appris_principal_4") {
+            Some(4)
+        } else if v.contains("appris_principal_5") {
+            Some(5)
+        } else {
+            None
+        }
+    })
+}
+
+fn parse_tsl(attrs: &HashMap<String, String>) -> Option<u8> {
+    attrs
+        .get("transcript_support_level")
+        .or(attrs.get("tsl"))
+        .and_then(|v| {
+            let first = v.chars().next()?;
+            if first.is_ascii_digit() {
+                first.to_digit(10).map(|d| d as u8)
+            } else {
+                None
+            }
+        })
+}
+
+fn pick_canonical_index(eligible: &[(ParsedTranscript, Transcript)]) -> usize {
+    // 1. MANE Select
+    if let Some(idx) = eligible.iter().position(|(m, _)| m.mane_select) {
+        return idx;
+    }
+    // 2. Ensembl Canonical
+    if let Some(idx) = eligible.iter().position(|(m, _)| m.ensembl_canonical) {
+        return idx;
+    }
+    // 3. APPRIS P1 > P2 ...
+    for level in 1..=5 {
+        if let Some(idx) = eligible.iter().position(|(m, _)| m.appris == Some(level)) {
+            return idx;
+        }
+    }
+    // 4. TSL 1 > 2 ...
+    for level in 1..=5 {
+        if let Some(idx) = eligible.iter().position(|(m, _)| m.tsl == Some(level)) {
+            return idx;
+        }
+    }
+    eligible.len() / 2
+}
+
+fn pick_common3p_index(eligible: &[(ParsedTranscript, Transcript)]) -> usize {
+    let mut end_groups: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (i, (_, tx)) in eligible.iter().enumerate() {
+        end_groups.entry(tx.three_prime_end()).or_default().push(i);
+    }
+
+    let max_count = end_groups.values().map(|v| v.len()).max().unwrap_or(0);
+    let candidates: Vec<&Vec<usize>> = end_groups.values().filter(|v| v.len() == max_count).collect();
+
+    let mut best_idx = 0;
+    let mut best_5p = 0;
+    let mut first = true;
+    let strand = eligible[0].1.strand;
+
+    for group in candidates {
+        for &idx in group {
+            let p5 = eligible[idx].1.five_prime_end();
+            if first {
+                best_idx = idx;
+                best_5p = p5;
+                first = false;
+            } else {
+                if strand == '+' {
+                    if p5 < best_5p {
+                        best_5p = p5;
+                        best_idx = idx;
+                    }
+                } else {
+                    if p5 > best_5p {
+                        best_5p = p5;
+                        best_idx = idx;
+                    }
+                }
+            }
+        }
+    }
+
+    best_idx
 }
 
 #[cfg(test)]

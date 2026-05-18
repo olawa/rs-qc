@@ -69,6 +69,16 @@ pub(crate) fn write_sample_reports(
         println!("Feature-count-like matrix written to: {}", counts_path);
     }
 
+    if config.stratify_length && !stats.stratified.is_empty() {
+        let gb_strat_path = format!("{}.{}.geneBodyCoverage.stratified.tsv", config.output, sample_name);
+        crate::stats::write_stratified_gene_body_tsv(&gb_strat_path, sample_name, &stats.stratified)?;
+        println!("Stratified gene body profiles written to: {}", gb_strat_path);
+
+        let p3_strat_path = format!("{}.{}.3p_anchor_normalized.stratified.tsv", config.output, sample_name);
+        crate::stats::write_stratified_3p_tsv(&p3_strat_path, sample_name, config.three_prime_bin_size, &stats.stratified)?;
+        println!("Stratified 3' anchor profiles written to: {}", p3_strat_path);
+    }
+
     Ok(())
 }
 
@@ -83,7 +93,7 @@ pub(crate) fn write_sample_visual_reports(
     annotation_format: AnnotationFormat,
 ) -> Result<()> {
     let term_start = std::time::Instant::now();
-    print_terminal_summary(sample_name, stats, qc, read_dist_counts)?;
+    print_terminal_summary(config, sample_name, stats, qc, read_dist_counts)?;
     println!("  - Terminal summary rendering took: {:?}", term_start.elapsed());
     write_sample_summary_json(config, sample_name, stats, qc, read_dist_counts)?;
 
@@ -274,6 +284,7 @@ pub(crate) fn write_multi_sample_outputs(
 }
 
 fn print_terminal_summary(
+    config: &RnaQcConfig,
     sample_name: &str,
     stats: &AggregatedStats,
     qc: &RnaSeqQcSummary,
@@ -281,6 +292,15 @@ fn print_terminal_summary(
 ) -> Result<()> {
     let rendered = render_rna_qc_terminal_summary(sample_name, stats, qc, read_dist_counts)?;
     println!("\n{}", rendered);
+    
+    if !stats.stratified.is_empty() {
+        println!("Stratified profiles written to:");
+        println!("  - TSV (gene body):    {}.{}.geneBodyCoverage.stratified.tsv", config.output, sample_name);
+        println!("  - TSV (3' profile):   {}.{}.3p_anchor_normalized.stratified.tsv", config.output, sample_name);
+        if !config.no_plot {
+            println!("  - SVG (summary):      {}.{}.rna.qc_summary.svg (contains stratified panels)", config.output, sample_name);
+        }
+    }
     println!("RNA QC summary");
     println!("--------------");
     println!("Reads passing QC:        {}", qc.aligned_qc_reads);
