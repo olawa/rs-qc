@@ -23,6 +23,24 @@ pub struct AlignmentQcConfig {
     pub show_progress: bool,
 }
 
+#[derive(Clone, Debug, Default, Serialize, PartialEq)]
+pub struct InsertSizeMetrics {
+    pub total_inserts: u64,
+    pub mono_nucleosomal_peak: Option<u32>,
+    pub di_nucleosomal_peak: Option<u32>,
+    pub mono_nucleosomal_count: u64,
+    pub di_nucleosomal_count: u64,
+    pub sub_nucleosomal_count: u64,
+    pub short_cfdna_count: u64,
+    pub mono_cfdna_count: u64,
+    pub cfdna_ratio: Option<f64>,
+    pub mono_di_ratio: Option<f64>,
+    pub short_fraction: f64,
+    pub mono_fraction: f64,
+    pub di_fraction: f64,
+    pub large_fragment_count: u64,
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct AlignmentQcMetrics {
     pub total_records: u64,
@@ -49,6 +67,7 @@ pub struct AlignmentQcMetrics {
     pub cigar_op_bases: BTreeMap<String, u64>,
     pub per_contig: BTreeMap<String, ContigAlignmentMetrics>,
     pub accuracy: AccuracyMetrics,
+    pub insert_size_metrics: Option<InsertSizeMetrics>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -245,6 +264,8 @@ pub fn run_alignment_qc(config: &AlignmentQcConfig) -> Result<AlignmentQcMetrics
             .with_context(|| format!("failed while scanning alignment input {input}"))?;
     }
 
+    metrics.insert_size_metrics = calculate_insert_size_metrics(&metrics.insert_size_hist);
+
     write_outputs(config, &metrics)?;
     Ok(metrics)
 }
@@ -309,6 +330,9 @@ fn write_outputs(config: &AlignmentQcConfig, metrics: &AlignmentQcMetrics) -> Re
     write_cigar(config, metrics)?;
     write_contigs(config, metrics)?;
     write_accuracy_hist(config, metrics)?;
+    if let Some(ref m) = metrics.insert_size_metrics {
+        write_insert_size_metrics(config, m)?;
+    }
     write_summary_json(
         &format!("{}.align.summary.json", config.output_prefix),
         "align",
@@ -474,6 +498,146 @@ fn fmt_optional(value: Option<f64>) -> String {
         .unwrap_or_else(|| "NA".to_string())
 }
 
+pub fn calculate_insert_size_metrics(hist: &BTreeMap<u32, u64>) -> Option<InsertSizeMetrics> {
+    let total_inserts: u64 = hist.values().sum();
+    if total_inserts == 0 {
+        return None;
+    }
+
+    let mut sub_nucleosomal_count = 0_u64;
+    let mut mono_nucleosomal_count = 0_u64;
+    let mut di_nucleosomal_count = 0_u64;
+    let mut short_cfdna_count = 0_u64;
+    let mut mono_cfdna_count = 0_u64;
+    let mut large_fragment_count = 0_u64;
+
+    for (&size, &count) in hist {
+        if size >= 30 && size < 143 {
+            sub_nucleosomal_count += count;
+        }
+        if size >= 143 && size <= 220 {
+            mono_nucleosomal_count += count;
+        }
+        if size >= 320 && size <= 480 {
+            di_nucleosomal_count += count;
+        }
+        if size >= 100 && size <= 150 {
+            short_cfdna_count += count;
+        }
+        if size >= 151 && size <= 220 {
+            mono_cfdna_count += count;
+        }
+        if size > 1000 {
+            large_fragment_count += count;
+        }
+    }
+
+    // Helper for smoothing counts to identify peaks robustly (window size 7: -3..=3)
+    let get_smoothed_count = |x: u32| -> f64 {
+        let mut sum = 0.0;
+        let mut count = 0;
+        for offset in -3..=3 {
+            let val = (x as i32 + offset) as u32;
+            if let Some(&c) = hist.get(&val) {
+                sum += c as f64;
+            }
+            count += 1;
+        }
+        sum / count as f64
+    };
+
+    // Find mono-nucleosomal peak (140-200 bp range)
+    let mut mono_nucleosomal_peak = None;
+    let mut max_mono_val = -1.0;
+    for x in 140..=200 {
+        let val = get_smoothed_count(x);
+        if val > max_mono_val && val > 0.0 {
+            max_mono_val = val;
+            mono_nucleosomal_peak = Some(x);
+        }
+    }
+
+    // Find di-nucleosomal peak (300-450 bp range)
+    let mut di_nucleosomal_peak = None;
+    let mut max_di_val = -1.0;
+    for x in 300..=450 {
+        let val = get_smoothed_count(x);
+        if val > max_di_val && val > 0.0 {
+            max_di_val = val;
+            di_nucleosomal_peak = Some(x);
+        }
+    }
+
+    let cfdna_ratio = if mono_cfdna_count > 0 {
+        Some(short_cfdna_count as f64 / mono_cfdna_count as f64)
+    } else {
+        None
+    };
+
+    let mono_di_ratio = if di_nucleosomal_count > 0 {
+        Some(mono_nucleosomal_count as f64 / di_nucleosomal_count as f64)
+    } else {
+        None
+    };
+
+    let short_fraction = sub_nucleosomal_count as f64 / total_inserts as f64;
+    let mono_fraction = mono_nucleosomal_count as f64 / total_inserts as f64;
+    let di_fraction = di_nucleosomal_count as f64 / total_inserts as f64;
+
+    Some(InsertSizeMetrics {
+        total_inserts,
+        mono_nucleosomal_peak,
+        di_nucleosomal_peak,
+        mono_nucleosomal_count,
+        di_nucleosomal_count,
+        sub_nucleosomal_count,
+        short_cfdna_count,
+        mono_cfdna_count,
+        cfdna_ratio,
+        mono_di_ratio,
+        short_fraction,
+        mono_fraction,
+        di_fraction,
+        large_fragment_count,
+    })
+}
+
+fn write_insert_size_metrics(config: &AlignmentQcConfig, metrics: &InsertSizeMetrics) -> Result<()> {
+    let mut out = File::create(format!("{}.align.insert_size_metrics.tsv", config.output_prefix))?;
+    writeln!(out, "metric\tvalue")?;
+    writeln!(out, "total_inserts\t{}", metrics.total_inserts)?;
+    writeln!(
+        out,
+        "mono_nucleosomal_peak\t{}",
+        metrics.mono_nucleosomal_peak.map(|x| x.to_string()).unwrap_or_else(|| "NA".to_string())
+    )?;
+    writeln!(
+        out,
+        "di_nucleosomal_peak\t{}",
+        metrics.di_nucleosomal_peak.map(|x| x.to_string()).unwrap_or_else(|| "NA".to_string())
+    )?;
+    writeln!(out, "mono_nucleosomal_count\t{}", metrics.mono_nucleosomal_count)?;
+    writeln!(out, "di_nucleosomal_count\t{}", metrics.di_nucleosomal_count)?;
+    writeln!(out, "sub_nucleosomal_count\t{}", metrics.sub_nucleosomal_count)?;
+    writeln!(out, "short_cfdna_count\t{}", metrics.short_cfdna_count)?;
+    writeln!(out, "mono_cfdna_count\t{}", metrics.mono_cfdna_count)?;
+    writeln!(
+        out,
+        "cfdna_ratio\t{}",
+        metrics.cfdna_ratio.map(|v| format!("{v:.6}")).unwrap_or_else(|| "NA".to_string())
+    )?;
+    writeln!(
+        out,
+        "mono_di_ratio\t{}",
+        metrics.mono_di_ratio.map(|v| format!("{v:.6}")).unwrap_or_else(|| "NA".to_string())
+    )?;
+    writeln!(out, "short_fraction\t{:.6}", metrics.short_fraction)?;
+    writeln!(out, "mono_fraction\t{:.6}", metrics.mono_fraction)?;
+    writeln!(out, "di_fraction\t{:.6}", metrics.di_fraction)?;
+    writeln!(out, "large_fragment_count\t{}", metrics.large_fragment_count)?;
+    Ok(())
+}
+
 pub fn sample_name_from_alignment_path(path: &str) -> String {
     Path::new(path)
         .file_name()
@@ -508,5 +672,59 @@ mod tests {
         acc.observe(0.03);
 
         assert_eq!(acc.mode().unwrap(), 0.99);
+    }
+
+    #[test]
+    fn test_calculate_insert_size_metrics() {
+        let mut hist = BTreeMap::new();
+        // Mono-nucleosomal peak at 167 bp (natural bell-curve gradient)
+        hist.insert(167, 100);
+        hist.insert(166, 75);
+        hist.insert(168, 75);
+        hist.insert(165, 50);
+        hist.insert(169, 50);
+        hist.insert(164, 20);
+        hist.insert(170, 20);
+
+        // Di-nucleosomal peak at 330 bp (natural bell-curve gradient)
+        hist.insert(330, 50);
+        hist.insert(329, 30);
+        hist.insert(331, 30);
+        hist.insert(328, 15);
+        hist.insert(332, 15);
+        hist.insert(327, 5);
+        hist.insert(333, 5);
+
+        // Sub-nucleosomal / short cfDNA
+        hist.insert(120, 20); // sub-nucleosome (30..143) and short cfDNA (100..150)
+        hist.insert(80, 10);  // sub-nucleosome (30..143)
+        hist.insert(1100, 5); // large (> 1000)
+
+        let res_opt = calculate_insert_size_metrics(&hist);
+        assert!(res_opt.is_some());
+        let res = res_opt.unwrap();
+
+        // Check peaks (smoothed)
+        assert_eq!(res.mono_nucleosomal_peak, Some(167));
+        assert_eq!(res.di_nucleosomal_peak, Some(330));
+
+        // Check counts
+        // mono-nucleosomal (143..=220): 100 + 75*2 + 50*2 + 20*2 = 390
+        assert_eq!(res.mono_nucleosomal_count, 390);
+        // di-nucleosomal (320..=480): 50 + 30*2 + 15*2 + 5*2 = 150
+        assert_eq!(res.di_nucleosomal_count, 150);
+        // sub-nucleosomal (30..143): 20 (at 120) + 10 (at 80) = 30
+        assert_eq!(res.sub_nucleosomal_count, 30);
+        // large (> 1000): 5
+        assert_eq!(res.large_fragment_count, 5);
+
+        // short cfDNA (100..150): 20
+        assert_eq!(res.short_cfdna_count, 20);
+        // mono cfDNA (151..220): 390
+        assert_eq!(res.mono_cfdna_count, 390);
+
+        // ratios
+        assert!((res.cfdna_ratio.unwrap() - 20.0 / 390.0).abs() < 1e-6); // 20 / 390
+        assert!((res.mono_di_ratio.unwrap() - 390.0 / 150.0).abs() < 1e-6);
     }
 }

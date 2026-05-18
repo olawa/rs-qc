@@ -481,6 +481,26 @@ fn run_align(args: AlignArgs) -> Result<()> {
             .map(|v| format!("{v:.4}"))
             .unwrap_or_else(|| "NA".to_string())
     );
+    if let Some(ref m) = metrics.insert_size_metrics {
+        println!("  - Insert Size & cfDNA Diagnostics:");
+        println!(
+            "    * Mono-nucleosomal Peak: {} bp",
+            m.mono_nucleosomal_peak.map(|x| x.to_string()).unwrap_or_else(|| "NA".to_string())
+        );
+        println!(
+            "    * Di-nucleosomal Peak:   {} bp",
+            m.di_nucleosomal_peak.map(|x| x.to_string()).unwrap_or_else(|| "NA".to_string())
+        );
+        println!(
+            "    * cfDNA Short/Mono Ratio: {}",
+            m.cfdna_ratio.map(|v| format!("{v:.4}")).unwrap_or_else(|| "NA".to_string())
+        );
+        println!(
+            "    * Mono/Di Ratio:          {}",
+            m.mono_di_ratio.map(|v| format!("{v:.4}")).unwrap_or_else(|| "NA".to_string())
+        );
+        println!("    * Sub-nucleosomal Frac:   {:.2}%", m.short_fraction * 100.0);
+    }
     println!(
         "  - Summary written to: {}.align.summary.txt",
         output_prefix
