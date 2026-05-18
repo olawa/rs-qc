@@ -9,6 +9,7 @@ pub(crate) fn aggregate_sample(
     index: &AnnotationIndex,
     config: &RnaQcConfig,
     state: &crate::analysis::rna_qc::state::RnaWorkerState,
+    ref_juncs: &crate::analysis::splice_junction::ReferenceJunctions,
 ) -> AggregatedStats {
     let three_prime_params = ThreePrimeParams {
         normalization_bp: config.normalization_bp,
@@ -41,6 +42,11 @@ pub(crate) fn aggregate_sample(
         stats.stratified_percentile_normalized =
             aggregate_rseqc_stratified(index, config.min_support as u32, config.coverage_weighted);
     }
+
+    stats.splice_junctions = Some(crate::analysis::splice_junction::compute_metrics(
+        &state.splice_junctions,
+        ref_juncs,
+    ));
 
     stats
 }

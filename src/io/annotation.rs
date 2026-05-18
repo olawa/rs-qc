@@ -62,6 +62,7 @@ pub enum IsoformSelect {
     Canonical,
 }
 
+#[derive(Debug, Clone)]
 pub struct AnnotationConfig {
     pub gene_id_delimiter: Option<char>,
     pub gene_id_regex: Option<String>,
@@ -359,7 +360,7 @@ fn load_transcripts_from_bed12(
     Ok(transcripts)
 }
 
-fn build_genes_from_transcripts(
+pub(crate) fn build_genes_from_transcripts(
     parsed: &[ParsedTranscript],
     config: &AnnotationConfig,
 ) -> Vec<Gene> {
@@ -530,7 +531,7 @@ fn parse_tsl(attrs: &HashMap<String, String>) -> Option<u8> {
         })
 }
 
-fn pick_canonical_index(eligible: &[(ParsedTranscript, Transcript)]) -> usize {
+pub(crate) fn pick_canonical_index(eligible: &[(ParsedTranscript, Transcript)]) -> usize {
     // 1. MANE Select
     if let Some(idx) = eligible.iter().position(|(m, _)| m.mane_select) {
         return idx;

@@ -11,3 +11,4 @@ pub mod report;
 pub mod rna_qc;
 pub mod snapshot;
 pub mod types;
+pub mod splice_junction;

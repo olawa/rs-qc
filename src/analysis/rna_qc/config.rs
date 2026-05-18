@@ -35,6 +35,8 @@ pub struct RnaQcConfig {
     pub snap_max_reads: usize,
     pub r2_only: bool,
     pub biotype: String,
+    pub distribution_biotype: String,
+    pub distribution_use_all_biotypes: bool,
     pub save_index: bool,
     pub load_index: bool,
     pub ends: bool,

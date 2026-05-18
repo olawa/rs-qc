@@ -202,7 +202,6 @@ fn scan_indexed_window(
 
     let win_start = window.start as u64;
     let win_end = window.end as u64;
-    let mut feature_cursor = maybe_feature.map(|chrom_index| chrom_index.cursor_at(win_start));
     let mut rdna_cursor = maybe_rdna_intervals.map(|chrom_index| chrom_index.cursor_at(win_start));
 
     let query = reader.query(ctx.header, &region).with_context(|| {
@@ -286,16 +285,16 @@ fn scan_indexed_window(
 
         if let Some(chrom_index) = maybe_feature {
             if owns_start {
-                state.total_tags += 1;
-                if let Some(cursor) = feature_cursor.as_mut() {
-                    let region = chrom_index.classify(pos, cursor);
-                    state.read_dist_counts[region as usize] += 1;
-                }
+                classify_read_distribution(state, &record, chrom_index, None);
             }
         } else {
             if owns_start {
                 state.unknown_chrom_reads += 1;
             }
+        }
+
+        if owns_start {
+            record_splice_junctions(state, &record, chrom, pos);
         }
 
         if let Some(dense) = maybe_dense {
@@ -388,7 +387,7 @@ fn scan_sequential_bam(ctx: &ScanContext<'_>) -> Result<RnaWorkerState> {
             _ => continue,
         };
         let Some((
-            _chrom,
+            chrom,
             _chrom_norm,
             maybe_dense,
             maybe_feature,
@@ -424,8 +423,10 @@ fn scan_sequential_bam(ctx: &ScanContext<'_>) -> Result<RnaWorkerState> {
             state.rdna_reads += 1;
         }
 
+        record_splice_junctions(&mut state, &record, chrom, pos);
+
         if let Some(chrom_index) = maybe_feature {
-            classify_read_distribution(&mut state, read_match_span, chrom_index, None);
+            classify_read_distribution(&mut state, &record, chrom_index, None);
         }
 
         if let Some(dense) = maybe_dense {
@@ -448,21 +449,46 @@ fn scan_sequential_bam(ctx: &ScanContext<'_>) -> Result<RnaWorkerState> {
 
 fn classify_read_distribution(
     state: &mut RnaWorkerState,
-    read_match_span: Option<(u64, u64)>,
+    record: &bam::Record,
     chrom_index: &Arc<ChromFeatureIndex>,
     window: Option<(u64, u64)>,
 ) {
-    if let Some((first_match, last_match)) = read_match_span {
-        let mid = first_match + (last_match - first_match) / 2;
-        if let Some((win_start, win_end)) = window {
+    let blocks = crate::io::bam::aligned_blocks(record);
+    if blocks.is_empty() {
+        return;
+    }
+
+    if let Some((win_start, win_end)) = window {
+        if let Some((first_match, last_match)) = crate::io::bam::match_span(record) {
+            let mid = first_match + (last_match - first_match) / 2;
             if mid < win_start || mid >= win_end {
                 return;
             }
+        } else {
+            return;
         }
-        let mut cursor = chrom_index.cursor_at(mid);
-        let region = chrom_index.classify(mid, &mut cursor);
-        state.read_dist_counts[region as usize] += 1;
-        state.total_tags += 1;
+    }
+
+    let region = chrom_index.classify_blocks(&blocks);
+    state.read_dist_counts[region as usize] += 1;
+    state.total_tags += 1;
+
+    state.distribution_total_classified_reads += 1;
+    use crate::analysis::read_distribution::RegionType;
+    match region {
+        RegionType::CdsExon | RegionType::Utr5Exon | RegionType::Utr3Exon | RegionType::Exon => {
+            state.distribution_exonic_reads += 1;
+        }
+        RegionType::Intron => {
+            state.distribution_intronic_reads += 1;
+        }
+        RegionType::TssUp1kb | RegionType::TssUp5kb | RegionType::TssUp10kb |
+        RegionType::TesDown1kb | RegionType::TesDown5kb | RegionType::TesDown10kb => {
+            state.distribution_flank_reads += 1;
+        }
+        RegionType::Intergenic => {
+            state.distribution_intergenic_reads += 1;
+        }
     }
 }
 
@@ -566,5 +592,57 @@ fn process_gene_hit(
         let dist_3p = (gene.total_len as usize).saturating_sub(s_5p as usize + 1);
         let bin = dist_3p / config.three_prime_bin_size;
         gene.add_3p(bin, 1);
+    }
+}
+
+pub(crate) fn record_splice_junctions(
+    state: &mut RnaWorkerState,
+    record: &impl noodles::sam::alignment::Record,
+    chrom: &str,
+    pos: u64,
+) {
+    use noodles::sam::alignment::record::cigar::op::Kind;
+    let mut curr_pos = pos;
+    for op in record.cigar().iter().filter_map(Result::ok) {
+        match op.kind() {
+            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch | Kind::Deletion => {
+                curr_pos += op.len() as u64;
+            }
+            Kind::Skip => {
+                let junc_start = curr_pos;
+                let junc_end = curr_pos + op.len() as u64;
+                curr_pos = junc_end;
+
+                let hash_val = {
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = ahash::AHasher::default();
+                    if let Some(name) = record.name() {
+                        name.as_bytes().hash(&mut hasher);
+                    } else {
+                        pos.hash(&mut hasher);
+                    }
+                    (hasher.finish() % 100) as u8
+                };
+
+                let is_rev = record.flags().map(|f| f.is_reverse_complemented()).unwrap_or(false);
+                let key = crate::analysis::splice_junction::JunctionKey {
+                    chrom: chrom.to_string(),
+                    start: junc_start,
+                    end: junc_end,
+                    strand: if is_rev { '-' } else { '+' },
+                };
+
+                state.splice_junctions.entry(key)
+                    .and_modify(|j| {
+                        j.count += 1;
+                        j.min_hash = j.min_hash.min(hash_val);
+                    })
+                    .or_insert(crate::analysis::splice_junction::ObservedJunction {
+                        count: 1,
+                        min_hash: hash_val,
+                    });
+            }
+            _ => {}
+        }
     }
 }

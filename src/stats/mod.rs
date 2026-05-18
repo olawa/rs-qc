@@ -86,6 +86,15 @@ pub struct AggregatedStats {
     pub unknown_chrom_reads: u64,
     pub stratified: HashMap<LengthStratum, StratumStats>,
     pub gene_qc: Vec<ThreePrimeGeneQc>,
+    pub distribution_transcripts_loaded: usize,
+    pub distribution_genes_loaded: usize,
+    pub distribution_biotypes_included: String,
+    pub distribution_total_classified_reads: u64,
+    pub distribution_exonic_reads: u64,
+    pub distribution_intronic_reads: u64,
+    pub distribution_flank_reads: u64,
+    pub distribution_intergenic_reads: u64,
+    pub splice_junctions: Option<crate::analysis::splice_junction::SpliceJunctionMetrics>,
 }
 
 #[allow(dead_code)]
@@ -366,6 +375,15 @@ pub fn aggregate_genes(
         unknown_chrom_reads: state.unknown_chrom_reads,
         stratified,
         gene_qc,
+        distribution_transcripts_loaded: state.distribution_transcripts_loaded,
+        distribution_genes_loaded: state.distribution_genes_loaded,
+        distribution_biotypes_included: state.distribution_biotypes_included.clone(),
+        distribution_total_classified_reads: state.distribution_total_classified_reads,
+        distribution_exonic_reads: state.distribution_exonic_reads,
+        distribution_intronic_reads: state.distribution_intronic_reads,
+        distribution_flank_reads: state.distribution_flank_reads,
+        distribution_intergenic_reads: state.distribution_intergenic_reads,
+        splice_junctions: None,
     }
 }
 
@@ -988,7 +1006,9 @@ mod tests {
             genes_by_chrom: Default::default(),
         };
 
-        let stats = aggregate_genes(&index, 10, &params, 10000, false);
+        let config = crate::analysis::rna_qc::config::RnaQcConfig::default();
+        let state = crate::analysis::rna_qc::state::RnaWorkerState::new(&config, 10000);
+        let stats = aggregate_genes(&index, 10, &params, &state, false);
 
         // Gene 1 and 3 are kept. Gene 2 is skipped.
         assert_eq!(stats.active_3p_genes, 2);

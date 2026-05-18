@@ -1,5 +1,5 @@
 mod aggregate;
-mod config;
+pub(crate) mod config;
 mod report;
 mod scan;
 pub(crate) mod state;
@@ -64,24 +64,69 @@ pub fn run_rna(config: RnaQcConfig) -> Result<()> {
 
     let index_path = format!("{}.ridx", config.annotation);
     let dist_enabled = config.analysis.contains(&AnalysisType::Distribution);
-    let (index_proto, feature_index) = if dist_enabled {
+    let (index_proto, feature_index, distribution_transcripts_loaded, distribution_genes_loaded, distribution_biotypes_included) = if dist_enabled {
         if config.load_index {
             println!(
                 "  - Distribution analysis needs transcript annotations, so the source annotation will be parsed instead of loading only the collapsed index."
             );
         }
         println!("  - Parsing source annotation: {}", config.annotation);
-        let loaded = load_annotation(&config.annotation, ann_format, &ann_config)?;
+
+        let dist_biotype_filter = if config.distribution_use_all_biotypes || config.distribution_biotype.eq_ignore_ascii_case("all") {
+            None
+        } else {
+            Some(config.distribution_biotype.clone())
+        };
+
+        let dist_ann_config = AnnotationConfig {
+            biotype_filter: dist_biotype_filter,
+            ..ann_config.clone()
+        };
+
+        let loaded = load_annotation(&config.annotation, ann_format, &dist_ann_config)?;
         println!("  - Extracted {} eligible genes.", loaded.genes.len());
         println!("  - Building distribution feature index...");
         let feature_index = Arc::new(FeatureIndex::build(&loaded.transcripts));
         println!("  - Initializing annotation index...");
-        let index = AnnotationIndex::new(loaded.genes, false);
+
+        let profile_transcripts: Vec<_> = loaded.transcripts.iter()
+            .filter(|tx| {
+                if let Some(ref target) = ann_config.biotype_filter {
+                    let targets: Vec<&str> = target.split(',').map(|s| s.trim()).collect();
+                    if let Some(ref b) = tx.biotype {
+                        targets.iter().any(|&t| t.eq_ignore_ascii_case(b))
+                    } else {
+                        false
+                    }
+                } else {
+                    true
+                }
+            })
+            .cloned()
+            .collect();
+        let profile_genes = crate::io::annotation::build_genes_from_transcripts(&profile_transcripts, &ann_config);
+
+        let index = AnnotationIndex::new(profile_genes, false);
         if config.save_index {
             println!("  - Saving index for future use: {}", index_path);
             index.save_to_file(&index_path)?;
         }
-        (index, Some(feature_index))
+
+        let mut biotypes_set = HashSet::new();
+        for tx in &loaded.transcripts {
+            if let Some(ref b) = tx.biotype {
+                biotypes_set.insert(b.clone());
+            }
+        }
+        let mut biotypes_list: Vec<_> = biotypes_set.into_iter().collect();
+        biotypes_list.sort();
+        let distribution_biotypes_included = if biotypes_list.is_empty() {
+            "none".to_string()
+        } else {
+            biotypes_list.join(",")
+        };
+
+        (index, Some(feature_index), loaded.transcripts.len(), loaded.genes.len(), distribution_biotypes_included)
     } else if config.load_index && std::path::Path::new(&index_path).exists() {
         println!("  - Loading pre-built index: {}", index_path);
         (
@@ -91,6 +136,9 @@ pub fn run_rna(config: RnaQcConfig) -> Result<()> {
                 config.three_prime_bin_size,
             )?,
             None,
+            0,
+            0,
+            String::new(),
         )
     } else {
         let genes = load_genes(&config.annotation, ann_format, &ann_config)?;
@@ -101,7 +149,7 @@ pub fn run_rna(config: RnaQcConfig) -> Result<()> {
             println!("  - Saving index for future use: {}", index_path);
             index.save_to_file(&index_path)?;
         }
-        (index, None)
+        (index, None, 0, 0, String::new())
     };
 
     let needs_coverage = config.analysis.contains(&AnalysisType::GeneBody)
@@ -120,6 +168,10 @@ pub fn run_rna(config: RnaQcConfig) -> Result<()> {
     );
 
     let rdna_contigs = Arc::new(normalized_name_set(&config.rdna_contigs));
+    println!("  - Building reference splice junctions database...");
+    let ref_juncs = Arc::new(crate::analysis::splice_junction::ReferenceJunctions::from_transcripts(
+        &load_annotation(&config.annotation, ann_format, &ann_config)?.transcripts
+    ));
     let rdna_intervals = if let Some(path) = &config.rdna_bed {
         println!("  - Loading rDNA intervals: {}", path);
         Some(Arc::new(ContaminantIndex::from_bed(path)?))
@@ -300,6 +352,10 @@ pub fn run_rna(config: RnaQcConfig) -> Result<()> {
             })?
         };
 
+        total_state.distribution_transcripts_loaded = distribution_transcripts_loaded;
+        total_state.distribution_genes_loaded = distribution_genes_loaded;
+        total_state.distribution_biotypes_included = distribution_biotypes_included.clone();
+
         if config.analysis.contains(&AnalysisType::Qc) {
             let qc_start = Instant::now();
             total_state.qc = scan_inline_qc_sample(
@@ -342,12 +398,14 @@ pub fn run_rna(config: RnaQcConfig) -> Result<()> {
                 let sample_ref = &sample_name;
                 let state_ref = &total_state;
                 let index_ref = coverage_index_ref;
+                let ref_juncs_clone = ref_juncs.clone();
                 s.spawn(move |_| {
                     let agg_start = Instant::now();
                     let stats = aggregate::aggregate_sample(
                         index_ref,
                         config_ref,
                         state_ref,
+                        &ref_juncs_clone,
                     );
                     println!("  - Coverage aggregation took: {:?}", agg_start.elapsed());
 

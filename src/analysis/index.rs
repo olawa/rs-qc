@@ -269,6 +269,7 @@ mod tests {
             }),
             counts_3p: Arc::new(Vec::new()),
             counts_percentile: Arc::new(Vec::new()),
+            num_isoforms: 1,
         };
 
         let mut gene2 = Gene {
@@ -287,6 +288,7 @@ mod tests {
             }),
             counts_3p: Arc::new(Vec::new()),
             counts_percentile: Arc::new(Vec::new()),
+            num_isoforms: 1,
         };
 
         let index = AnnotationIndex::new(vec![gene1, gene2], false);

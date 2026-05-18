@@ -41,6 +41,20 @@ struct RnaSampleSummary {
     intronic_reads: u64,
     flanking_reads: u64,
     intergenic_reads: u64,
+    distribution_transcripts_loaded: usize,
+    distribution_genes_loaded: usize,
+    distribution_biotypes_included: String,
+    distribution_total_classified_reads: u64,
+    distribution_exonic_reads: u64,
+    distribution_intronic_reads: u64,
+    distribution_flank_reads: u64,
+    distribution_intergenic_reads: u64,
+    unique_known_junctions: Option<usize>,
+    unique_partial_novel_junctions: Option<usize>,
+    unique_novel_junctions: Option<usize>,
+    total_known_junction_reads: Option<u64>,
+    total_partial_novel_junction_reads: Option<u64>,
+    total_novel_junction_reads: Option<u64>,
 }
 
 pub(crate) fn write_sample_reports(
@@ -77,6 +91,65 @@ pub(crate) fn write_sample_reports(
         let p3_strat_path = format!("{}.{}.3p_anchor_normalized.stratified.tsv", config.output, sample_name);
         crate::stats::write_stratified_3p_tsv(&p3_strat_path, sample_name, config.three_prime_bin_size, &stats.stratified)?;
         println!("Stratified 3' anchor profiles written to: {}", p3_strat_path);
+    }
+
+    if let Some(ref juncs) = stats.splice_junctions {
+        let junc_start = std::time::Instant::now();
+        write_splice_junction_reports(&config.output, sample_name, juncs)?;
+        println!(
+            "Splice junction reports written to: {}.{}.splice_junctions.tsv (took: {:?})",
+            config.output,
+            sample_name,
+            junc_start.elapsed()
+        );
+    }
+
+    Ok(())
+}
+
+pub fn write_splice_junction_reports(
+    prefix: &str,
+    sample_name: &str,
+    metrics: &crate::analysis::splice_junction::SpliceJunctionMetrics,
+) -> Result<()> {
+    // 1. Detailed splice junctions TSV
+    {
+        let details_path = format!("{prefix}.{sample_name}.splice_junctions.tsv");
+        let mut file = std::fs::File::create(&details_path)?;
+        use std::io::Write;
+        writeln!(
+            file,
+            "chrom\tstart\tend\tstrand\tnovelty\tread_support"
+        )?;
+        for j in &metrics.details {
+            writeln!(
+                file,
+                "{}\t{}\t{}\t{}\t{:?}\t{}",
+                j.chrom, j.start, j.end, j.strand, j.novelty, j.read_support
+            )?;
+        }
+    }
+
+    // 2. Saturation curve TSV
+    {
+        let sat_path = format!("{prefix}.{sample_name}.junction_saturation.tsv");
+        let mut file = std::fs::File::create(&sat_path)?;
+        use std::io::Write;
+        writeln!(
+            file,
+            "fraction\tknown\tpartial_novel\tnovel"
+        )?;
+        for bin in 0..10 {
+            let pct = (bin + 1) * 10;
+            writeln!(
+                file,
+                "{}%\t{}\t{}\t{}",
+                pct,
+                metrics.saturation_known[bin],
+                metrics.saturation_partial_novel[bin],
+                metrics.saturation_novel[bin]
+            )?;
+        }
     }
 
     Ok(())
@@ -458,6 +531,20 @@ fn build_sample_summary(
         intronic_reads: intronic,
         flanking_reads: flanking,
         intergenic_reads: intergenic,
+        distribution_transcripts_loaded: stats.distribution_transcripts_loaded,
+        distribution_genes_loaded: stats.distribution_genes_loaded,
+        distribution_biotypes_included: stats.distribution_biotypes_included.clone(),
+        distribution_total_classified_reads: stats.distribution_total_classified_reads,
+        distribution_exonic_reads: stats.distribution_exonic_reads,
+        distribution_intronic_reads: stats.distribution_intronic_reads,
+        distribution_flank_reads: stats.distribution_flank_reads,
+        distribution_intergenic_reads: stats.distribution_intergenic_reads,
+        unique_known_junctions: stats.splice_junctions.as_ref().map(|j| j.unique_known),
+        unique_partial_novel_junctions: stats.splice_junctions.as_ref().map(|j| j.unique_partial_novel),
+        unique_novel_junctions: stats.splice_junctions.as_ref().map(|j| j.unique_novel),
+        total_known_junction_reads: stats.splice_junctions.as_ref().map(|j| j.total_known_reads),
+        total_partial_novel_junction_reads: stats.splice_junctions.as_ref().map(|j| j.total_partial_novel_reads),
+        total_novel_junction_reads: stats.splice_junctions.as_ref().map(|j| j.total_novel_reads),
     }
 }
 

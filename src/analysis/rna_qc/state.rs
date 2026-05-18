@@ -20,6 +20,15 @@ pub(crate) struct RnaWorkerState {
     pub(crate) unknown_chrom_reads: u64,
     pub(crate) qc: InlineQcState,
     pub(crate) config: super::config::RnaQcConfig,
+    pub(crate) distribution_transcripts_loaded: usize,
+    pub(crate) distribution_genes_loaded: usize,
+    pub(crate) distribution_biotypes_included: String,
+    pub(crate) distribution_total_classified_reads: u64,
+    pub(crate) distribution_exonic_reads: u64,
+    pub(crate) distribution_intronic_reads: u64,
+    pub(crate) distribution_flank_reads: u64,
+    pub(crate) distribution_intergenic_reads: u64,
+    pub(crate) splice_junctions: std::collections::HashMap<crate::analysis::splice_junction::JunctionKey, crate::analysis::splice_junction::ObservedJunction>,
 }
 
 impl RnaWorkerState {
@@ -39,6 +48,15 @@ impl RnaWorkerState {
             unknown_chrom_reads: 0,
             qc: InlineQcState::new(qc_sample_size),
             config: config.clone(),
+            distribution_transcripts_loaded: 0,
+            distribution_genes_loaded: 0,
+            distribution_biotypes_included: String::new(),
+            distribution_total_classified_reads: 0,
+            distribution_exonic_reads: 0,
+            distribution_intronic_reads: 0,
+            distribution_flank_reads: 0,
+            distribution_intergenic_reads: 0,
+            splice_junctions: std::collections::HashMap::new(),
         }
     }
 
@@ -59,7 +77,23 @@ impl RnaWorkerState {
         }
         self.unknown_chrom_reads += other.unknown_chrom_reads;
 
+        self.distribution_total_classified_reads += other.distribution_total_classified_reads;
+        self.distribution_exonic_reads += other.distribution_exonic_reads;
+        self.distribution_intronic_reads += other.distribution_intronic_reads;
+        self.distribution_flank_reads += other.distribution_flank_reads;
+        self.distribution_intergenic_reads += other.distribution_intergenic_reads;
+
         self.qc.merge_from(other.qc);
+
+        for (key, other_j) in other.splice_junctions {
+            self.splice_junctions.entry(key)
+                .and_modify(|j| {
+                    j.count += other_j.count;
+                    j.min_hash = j.min_hash.min(other_j.min_hash);
+                })
+                .or_insert(other_j);
+        }
+
         self
     }
 
@@ -70,6 +104,19 @@ impl RnaWorkerState {
     ) -> Result<()> {
         let mut f_dist = File::create(path)?;
         use crate::analysis::read_distribution::RegionType;
+
+        writeln!(f_dist, "{:<38}{}", "distribution_transcripts_loaded", self.distribution_transcripts_loaded)?;
+        writeln!(f_dist, "{:<38}{}", "distribution_genes_loaded", self.distribution_genes_loaded)?;
+        writeln!(f_dist, "{:<38}{}", "distribution_biotypes_included", self.distribution_biotypes_included)?;
+        writeln!(f_dist, "{:<38}{}", "distribution_total_classified_reads", self.distribution_total_classified_reads)?;
+        writeln!(f_dist, "{:<38}{}", "distribution_exonic_reads", self.distribution_exonic_reads)?;
+        writeln!(f_dist, "{:<38}{}", "distribution_intronic_reads", self.distribution_intronic_reads)?;
+        writeln!(f_dist, "{:<38}{}", "distribution_flank_reads", self.distribution_flank_reads)?;
+        writeln!(f_dist, "{:<38}{}", "distribution_intergenic_reads", self.distribution_intergenic_reads)?;
+        writeln!(
+            f_dist,
+            "====================================================================="
+        )?;
 
         let total_assigned: u64 = (0..12)
             .filter(|&i| i != RegionType::Intergenic as usize)

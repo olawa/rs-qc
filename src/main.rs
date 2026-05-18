@@ -289,6 +289,10 @@ struct RnaArgs {
     r2_only: bool,
     #[arg(long, default_value = "protein_coding")]
     biotype: String,
+    #[arg(long, default_value = "all")]
+    distribution_biotype: String,
+    #[arg(long, default_value_t = false)]
+    distribution_use_all_biotypes: bool,
     #[arg(long, default_value_t = false)]
     save_index: bool,
     #[arg(long, default_value_t = false)]
@@ -333,6 +337,7 @@ struct RnaArgs {
     pub three_prime_min_anchor_nonzero_bins: usize,
     #[arg(long, default_value_t = 3.0)]
     pub three_prime_max_ratio: f64,
+    #[arg(long, default_value_t = false)]
     pub write_counts: bool,
     #[arg(long, default_value_t = false)]
     pub write_gene_profiles: bool,
@@ -396,6 +401,8 @@ fn run_rna_wrapper(args: RnaArgs) -> Result<()> {
         snap_max_reads: args.snap_max_reads,
         r2_only: args.r2_only,
         biotype: args.biotype,
+        distribution_biotype: args.distribution_biotype,
+        distribution_use_all_biotypes: args.distribution_use_all_biotypes,
         save_index: args.save_index,
         load_index: args.load_index,
         ends: args.ends,

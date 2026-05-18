@@ -156,6 +156,50 @@ impl ChromFeatureIndex {
 
         RegionType::Intergenic
     }
+
+    pub fn classify_blocks(&self, blocks: &[Exon]) -> RegionType {
+        if blocks.is_empty() {
+            return RegionType::Intergenic;
+        }
+
+        let mut has_exon = false;
+        let mut has_intron = false;
+        let mut has_flank = false;
+
+        for block in blocks {
+            let mut idx = self.intervals.partition_point(|iv| iv.end <= block.start);
+            while idx < self.intervals.len() {
+                let iv = &self.intervals[idx];
+                if iv.start >= block.end {
+                    break;
+                }
+                match iv.region {
+                    RegionType::CdsExon | RegionType::Utr5Exon | RegionType::Utr3Exon | RegionType::Exon => {
+                        has_exon = true;
+                    }
+                    RegionType::Intron => {
+                        has_intron = true;
+                    }
+                    RegionType::TssUp1kb | RegionType::TssUp5kb | RegionType::TssUp10kb |
+                    RegionType::TesDown1kb | RegionType::TesDown5kb | RegionType::TesDown10kb => {
+                        has_flank = true;
+                    }
+                    _ => {}
+                }
+                idx += 1;
+            }
+        }
+
+        if has_exon {
+            RegionType::Exon
+        } else if has_intron {
+            RegionType::Intron
+        } else if has_flank {
+            RegionType::TssUp1kb
+        } else {
+            RegionType::Intergenic
+        }
+    }
 }
 
 fn emit_transcript_events(tx: &ParsedTranscript, events: &mut Vec<FeatureEvent>) {
@@ -371,6 +415,10 @@ mod tests {
             cds_start,
             cds_end,
             strategy: IdResolutionStrategy::GtfExplicit,
+            mane_select: false,
+            ensembl_canonical: false,
+            appris: None,
+            tsl: None,
         }
     }
 
