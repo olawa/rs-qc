@@ -594,6 +594,8 @@ fn write_snapshots(
                     show_reference_base_track: false,
                     show_sample_base_track: false,
                     squash: false,
+                    markers_path: None,
+                    inline_markers: Vec::new(),
                 };
                 run_snapshot(&snapshot_cfg).with_context(|| {
                     format!("failed to render snapshot for {}", target.gene_name)

@@ -181,6 +181,9 @@ struct SnapArgs {
     base_track: SnapBaseTrackMode,
     #[arg(long, value_enum, default_value = "auto")]
     format: SnapFormat,
+    /// Path to a TSV file specifying genomic markers to overlay (e.g. variants, SVs). Format: chrom\tposition\tlabel\tmarker_type\t[end_position]
+    #[arg(long)]
+    markers: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -722,6 +725,8 @@ fn run_snap(args: SnapArgs) -> Result<()> {
         show_reference_base_track,
         show_sample_base_track,
         squash: args.squash,
+        markers_path: args.markers,
+        inline_markers: Vec::new(),
     };
 
     run_snapshot(&config)?;

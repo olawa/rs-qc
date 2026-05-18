@@ -7,8 +7,8 @@ use noodles::sam::alignment::record::data::field::{Tag, Value};
 use noodles::{bam, fasta, sam};
 use regex::Regex;
 use region_plot::{
-    render_to_path, BasePileup, CoveragePoint, GeneModel, PlotOptions, ReadModel, ReadSegment,
-    RegionPlot, SamplePlotData,
+    render_to_path, BasePileup, CoveragePoint, GeneModel, MarkerType, PlotOptions, ReadModel,
+    ReadSegment, RegionPlot, SamplePlotData, SnappingMarker,
 };
 use std::collections::HashMap;
 use std::fs::File;
@@ -56,6 +56,8 @@ pub struct SnapshotConfig {
     pub show_reference_base_track: bool,
     pub show_sample_base_track: bool,
     pub squash: bool,
+    pub markers_path: Option<String>,
+    pub inline_markers: Vec<region_plot::SnappingMarker>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +112,12 @@ pub fn build_region_plot(config: &SnapshotConfig) -> Result<RegionPlot> {
         .unwrap_or(&config.bam_path)
         .to_string();
 
+    let mut markers = config.inline_markers.clone();
+    if let Some(ref path) = config.markers_path {
+        let file_markers = parse_markers_file(path)?;
+        markers.extend(file_markers);
+    }
+
     Ok(RegionPlot {
         chrom: config.region.chrom.clone(),
         start: config.region.start as i64,
@@ -122,7 +130,54 @@ pub fn build_region_plot(config: &SnapshotConfig) -> Result<RegionPlot> {
             pileup,
             coverage,
         }],
+        markers,
     })
+}
+
+pub fn parse_markers_file(path: &str) -> Result<Vec<SnappingMarker>> {
+    let file = File::open(path)
+        .with_context(|| format!("failed to open markers file: {path}"))?;
+    let reader = std::io::BufReader::new(file);
+    let mut markers = Vec::new();
+
+    for (line_idx, line_res) in reader.lines().enumerate() {
+        let line = line_res?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let parts: Vec<&str> = trimmed.split('\t').collect();
+        if parts.len() < 4 {
+            bail!("invalid marker line {}: expected at least 4 tab-separated columns (chrom, position, label, marker_type)", line_idx + 1);
+        }
+
+        let pos: i64 = parts[1].parse()
+            .with_context(|| format!("invalid marker position '{}' at line {}", parts[1], line_idx + 1))?;
+        let label = parts[2].to_string();
+        let marker_type_str = parts[3].to_lowercase();
+        let marker_type = match marker_type_str.as_str() {
+            "variant" | "snv" | "indel" => MarkerType::Variant,
+            "structuralvariant" | "sv" => MarkerType::StructuralVariant,
+            "regionofinterest" | "roi" | "region" => MarkerType::RegionOfInterest,
+            other => bail!("unknown marker type '{}' at line {}. Supported: Variant, StructuralVariant, RegionOfInterest", other, line_idx + 1),
+        };
+        let end_pos = if parts.len() > 4 && !parts[4].is_empty() {
+            let ep: i64 = parts[4].parse()
+                .with_context(|| format!("invalid marker end_pos '{}' at line {}", parts[4], line_idx + 1))?;
+            Some(ep)
+        } else {
+            None
+        };
+
+        markers.push(SnappingMarker {
+            pos,
+            label,
+            marker_type,
+            end_pos,
+        });
+    }
+
+    Ok(markers)
 }
 
 pub fn resolve_snapshot_region(
@@ -1376,10 +1431,79 @@ mod tests {
                     .map(|pos| CoveragePoint { pos, depth: 1 })
                     .collect(),
             }],
+            markers: Vec::new(),
         };
         render_to_path(&plot, &PlotOptions::default(), &path).unwrap();
         let svg = std::fs::read_to_string(path).unwrap();
         assert!(svg.contains("<svg"));
+    }
+
+    #[test]
+    fn test_parse_markers_file() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("markers.tsv");
+        std::fs::write(&path, 
+            "chr1\t10020\tC>T\tVariant\n\
+             chr1\t10100\tDEL_1\tStructuralVariant\t10250\n\
+             chr1\t10050\tROI_A\tRegionOfInterest\t10080\n"
+        ).unwrap();
+
+        let parsed = parse_markers_file(path.to_str().unwrap()).unwrap();
+        assert_eq!(parsed.len(), 3);
+
+        assert_eq!(parsed[0].pos, 10020);
+        assert_eq!(parsed[0].label, "C>T");
+        assert_eq!(parsed[0].marker_type, MarkerType::Variant);
+        assert_eq!(parsed[0].end_pos, None);
+
+        assert_eq!(parsed[1].pos, 10100);
+        assert_eq!(parsed[1].label, "DEL_1");
+        assert_eq!(parsed[1].marker_type, MarkerType::StructuralVariant);
+        assert_eq!(parsed[1].end_pos, Some(10250));
+
+        assert_eq!(parsed[2].pos, 10050);
+        assert_eq!(parsed[2].label, "ROI_A");
+        assert_eq!(parsed[2].marker_type, MarkerType::RegionOfInterest);
+        assert_eq!(parsed[2].end_pos, Some(10080));
+    }
+
+    #[test]
+    fn test_renders_svg_with_markers() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("snap_markers.svg");
+        let plot = RegionPlot {
+            chrom: "chr1".to_string(),
+            start: 10000,
+            end: 10500,
+            reference: Some(vec![b'A'; 500]),
+            genes: Vec::new(),
+            samples: Vec::new(),
+            markers: vec![
+                SnappingMarker {
+                    pos: 10020,
+                    label: "C>T".to_string(),
+                    marker_type: MarkerType::Variant,
+                    end_pos: None,
+                },
+                SnappingMarker {
+                    pos: 10100,
+                    label: "DEL_1".to_string(),
+                    marker_type: MarkerType::StructuralVariant,
+                    end_pos: Some(10250),
+                },
+                SnappingMarker {
+                    pos: 10050,
+                    label: "ROI_A".to_string(),
+                    marker_type: MarkerType::RegionOfInterest,
+                    end_pos: Some(10080),
+                },
+            ],
+        };
+        render_to_path(&plot, &PlotOptions::default(), &path).unwrap();
+        let svg = std::fs::read_to_string(path).unwrap();
+        assert!(svg.contains("<svg"));
+        assert!(svg.contains("C&gt;T") || svg.contains("C>T"));
+        assert!(svg.contains("DEL_1"));
     }
 }
 fn chrom_match(c1: &str, c2: &str) -> bool {

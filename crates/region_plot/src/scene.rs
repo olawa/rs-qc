@@ -1,5 +1,7 @@
 use crate::layout::{place_genes, place_reads};
-use crate::model::{BasePileup, GeneModel, ReadModel, ReadSegment, RegionPlot, SamplePlotData};
+use crate::model::{
+    BasePileup, GeneModel, MarkerType, ReadModel, ReadSegment, RegionPlot, SamplePlotData,
+};
 use crate::render::PlotOptions;
 use plotters::style::RGBColor;
 use std::collections::HashSet;
@@ -85,6 +87,132 @@ impl PlotGeom {
     }
 }
 
+fn draw_background_markers(
+    elements: &mut Vec<VisualElement>,
+    plot: &RegionPlot,
+    geom: PlotGeom,
+    height: f64,
+) {
+    for marker in &plot.markers {
+        if matches!(marker.marker_type, MarkerType::RegionOfInterest) {
+            let start = marker.pos;
+            let end = marker.end_pos.unwrap_or(start + 1);
+            if start >= plot.end || end <= plot.start {
+                continue;
+            }
+            let x1 = geom.x(start, plot);
+            let x2 = geom.x(end, plot).max(x1 + 1.0);
+            elements.push(VisualElement::Rect {
+                x1,
+                y1: 0.0,
+                x2,
+                y2: height,
+                color: Rgb(254, 243, 199), // Soft amber background highlight
+            });
+        }
+    }
+}
+
+fn draw_foreground_markers(
+    elements: &mut Vec<VisualElement>,
+    plot: &RegionPlot,
+    opts: &PlotOptions,
+    geom: PlotGeom,
+    height: f64,
+) {
+    let mut label_y_offset = 0.0;
+    for marker in &plot.markers {
+        let x = geom.x(marker.pos, plot);
+        match marker.marker_type {
+            MarkerType::Variant => {
+                if marker.pos >= plot.start && marker.pos < plot.end {
+                    elements.push(VisualElement::Line {
+                        x1: x,
+                        y1: opts.margin_top as f64,
+                        x2: x,
+                        y2: height - opts.margin_bottom as f64,
+                        color: Rgb(220, 38, 38), // Red
+                        width: 2,
+                    });
+
+                    let pin_y = opts.margin_top as f64 + 4.0;
+                    elements.push(VisualElement::Circle {
+                        x,
+                        y: pin_y,
+                        radius: 4.5,
+                        color: Rgb(220, 38, 38),
+                    });
+
+                    elements.push(VisualElement::Text {
+                        x: (x + 6.0).min(opts.width as f64 - 150.0),
+                        y: pin_y + 4.0 + label_y_offset,
+                        text: marker.label.clone(),
+                        color: Rgb(220, 38, 38),
+                        size: 11,
+                    });
+                    label_y_offset = (label_y_offset + 12.0) % 36.0;
+                }
+            }
+            MarkerType::StructuralVariant => {
+                let start = marker.pos;
+                let end = marker.end_pos.unwrap_or(start + 1);
+                if start >= plot.end || end <= plot.start {
+                    continue;
+                }
+                let x1 = geom.x(start, plot);
+                let x2 = geom.x(end, plot).max(x1 + 1.0);
+                let bracket_y = opts.margin_top as f64 + 20.0;
+
+                elements.push(VisualElement::Line {
+                    x1,
+                    y1: bracket_y,
+                    x2,
+                    y2: bracket_y,
+                    color: Rgb(37, 99, 235), // Blue
+                    width: 3,
+                });
+                elements.push(VisualElement::Line {
+                    x1,
+                    y1: bracket_y - 4.0,
+                    x2: x1,
+                    y2: bracket_y + 4.0,
+                    color: Rgb(37, 99, 235),
+                    width: 2,
+                });
+                elements.push(VisualElement::Line {
+                    x1: x2,
+                    y1: bracket_y - 4.0,
+                    x2: x2,
+                    y2: bracket_y + 4.0,
+                    color: Rgb(37, 99, 235),
+                    width: 2,
+                });
+
+                for bx in &[x1, x2] {
+                    elements.push(VisualElement::Line {
+                        x1: *bx,
+                        y1: bracket_y + 4.0,
+                        x2: *bx,
+                        y2: height - opts.margin_bottom as f64,
+                        color: Rgb(147, 197, 253), // Soft light blue boundary
+                        width: 1,
+                    });
+                }
+
+                let text_x = x1 + (x2 - x1) * 0.5 - (marker.label.len() as f64 * 3.0);
+                elements.push(VisualElement::Text {
+                    x: text_x.clamp(geom.x0, opts.width as f64 - 150.0),
+                    y: bracket_y - 6.0,
+                    text: marker.label.clone(),
+                    color: Rgb(37, 99, 235),
+                    size: 11,
+                });
+            }
+            MarkerType::RegionOfInterest => {}
+        }
+    }
+}
+
 pub fn build_scene(plot: &RegionPlot, opts: &PlotOptions) -> Scene {
     let height = resolved_height(plot, opts);
     let geom = PlotGeom {
@@ -98,6 +226,8 @@ pub fn build_scene(plot: &RegionPlot, opts: &PlotOptions) -> Scene {
         y2: height as f64,
         color: opts.style.background.into(),
     }];
+
+    draw_background_markers(&mut elements, plot, geom, height as f64);
 
     let mut y = opts.margin_top as f64;
     elements.push(VisualElement::Text {
@@ -128,6 +258,8 @@ pub fn build_scene(plot: &RegionPlot, opts: &PlotOptions) -> Scene {
         draw_sample(&mut elements, sample, plot, opts, geom, y);
         y += sample_height(sample, opts) as f64;
     }
+
+    draw_foreground_markers(&mut elements, plot, opts, geom, height as f64);
 
     Scene {
         width: opts.width,

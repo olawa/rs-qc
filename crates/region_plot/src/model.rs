@@ -12,6 +12,8 @@ pub struct RegionPlot {
     pub reference: Option<Vec<u8>>,
     pub genes: Vec<GeneModel>,
     pub samples: Vec<SamplePlotData>,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub markers: Vec<SnappingMarker>,
 }
 
 impl RegionPlot {
@@ -83,6 +85,23 @@ pub struct GeneModel {
     pub end: i64,
     pub strand: Option<Strand>,
     pub exons: Vec<(i64, i64)>,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, Copy, PartialEq, Eq)]
+pub enum MarkerType {
+    Variant,
+    StructuralVariant,
+    RegionOfInterest,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SnappingMarker {
+    pub pos: i64,
+    pub label: String,
+    pub marker_type: MarkerType,
+    pub end_pos: Option<i64>,
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
