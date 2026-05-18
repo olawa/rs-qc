@@ -168,129 +168,763 @@ fn push_unique(files: &mut Vec<PathBuf>, candidate: PathBuf) {
 }
 
 fn render_html(document: &ReportDocument) -> String {
-    let module_counts = overview_module_counts(document);
+    let json_data = serde_json::to_string(document).unwrap_or_else(|_| "{}".to_string());
+    let safe_json_data = json_data.replace("</script>", "<\\/script>");
+
     let mut out = String::new();
     out.push_str("<!doctype html><html><head><meta charset=\"utf-8\">");
     out.push_str("<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">");
-    out.push_str("<title>rs-qc report</title>");
+    out.push_str("<title>rs-qc Interactive Dashboard</title>");
+    
+    // Inject OutFit Google Font and Chart.js from CDN
+    out.push_str("<link rel=\"preconnect\" href=\"https://fonts.googleapis.com\">");
+    out.push_str("<link rel=\"preconnect\" href=\"https://fonts.gstatic.com\" crossorigin>");
+    out.push_str("<link href=\"https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=Plus+Jakarta+Sans:wght@300;400;500;600;700&display=swap\" rel=\"stylesheet\">");
+    out.push_str("<script src=\"https://cdn.jsdelivr.net/npm/chart.js\"></script>");
+
+    // Sleek modern styling
     out.push_str(
         "<style>\
-        :root{color-scheme:light}\
-        body{font-family:system-ui,-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif; margin:0; padding:32px; background:linear-gradient(180deg,#f8faff 0%,#eef2f8 100%); color:#142033;}\
-        .wrap{max-width:1200px; margin:0 auto;}\
-        h1{margin:0 0 8px 0; font-size:2.15rem;}\
-        .sub{color:#5a6475; margin:0 0 24px 0;}\
-        .overview{display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:14px; margin:0 0 24px 0;}\
-        .stat{background:#fff; border:1px solid #e2e7f0; border-radius:14px; padding:14px 16px; box-shadow:0 1px 3px rgba(20,32,51,.06);}\
-        .stat .label{display:block; color:#64748b; font-size:.82rem; text-transform:uppercase; letter-spacing:.04em; margin-bottom:6px;}\
-        .stat .value{font-size:1.4rem; font-weight:700;}\
-        .section{background:#fff; border:1px solid #e2e7f0; border-radius:14px; padding:18px 20px; margin:0 0 18px 0; box-shadow:0 1px 3px rgba(20,32,51,.06);}\
-        .section-head{display:flex; justify-content:space-between; gap:12px; align-items:flex-start; flex-wrap:wrap;}\
-        .badge{display:inline-flex; align-items:center; gap:6px; border-radius:999px; background:#eef4ff; color:#274b9f; padding:4px 10px; font-size:.78rem; font-weight:700; text-transform:uppercase; letter-spacing:.05em;}\
-        .meta{display:flex; gap:12px; flex-wrap:wrap; color:#5a6475; font-size:.92rem; margin:10px 0 12px 0;}\
-        .links{display:flex; gap:10px; flex-wrap:wrap; margin:10px 0 14px 0;}\
-        .links a{display:inline-block; text-decoration:none; color:#1d4ed8; background:#eff6ff; border:1px solid #dbeafe; border-radius:10px; padding:6px 10px; font-size:.9rem;}\
-        .figure{margin:14px 0 16px 0;}\
-        .figure img{display:block; width:100%; height:auto; border:1px solid #e2e7f0; border-radius:12px; background:#fff;}\
-        .snapshots{display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:10px; margin:14px 0 0 0;}\
-        .snapshot{border:1px solid #e2e7f0; border-radius:12px; padding:10px 12px; background:#f8fbff;}\
-        .snapshot a{color:#1d4ed8; text-decoration:none; font-weight:700;}\
-        .snapshot .meta{margin:6px 0 0 0; font-size:.84rem; color:#64748b;}\
-        table{width:100%; border-collapse:collapse; font-size:.94rem;}\
-        td{padding:6px 8px; border-top:1px solid #edf1f7; vertical-align:top;}\
-        td.key{font-weight:600; width:34%; color:#243047;}\
-        details{margin-top:14px;}\
-        pre{white-space:pre-wrap; word-break:break-word; background:#0f172a; color:#e5eefc; border-radius:12px; padding:14px; overflow:auto;}\
+        :root {\
+            --primary: #2563eb;\
+            --primary-light: #eff6ff;\
+            --primary-border: #dbeafe;\
+            --success: #10b981;\
+            --success-light: #ecfdf5;\
+            --warning: #f59e0b;\
+            --danger: #ef4444;\
+            --bg-dark: #0f172a;\
+            --bg-sidebar: #1e293b;\
+            --bg-body: #f8fafc;\
+            --bg-card: #ffffff;\
+            --text-main: #1e293b;\
+            --text-muted: #64748b;\
+            --border-color: #e2e8f0;\
+            --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.05);\
+            --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);\
+            --radius-md: 12px;\
+            --radius-lg: 16px;\
+        }\
+        * { box-sizing: border-box; margin: 0; padding: 0; }\
+        body {\
+            font-family: 'Plus Jakarta Sans', 'Outfit', system-ui, sans-serif;\
+            background-color: var(--bg-body);\
+            color: var(--text-main);\
+            display: flex;\
+            min-height: 100vh;\
+            overflow-x: hidden;\
+        }\
+        .sidebar {\
+            width: 280px;\
+            background: linear-gradient(180deg, var(--bg-sidebar) 0%, var(--bg-dark) 100%);\
+            color: #fff;\
+            padding: 32px 24px;\
+            display: flex;\
+            flex-direction: column;\
+            flex-shrink: 0;\
+            border-right: 1px solid rgba(255, 255, 255, 0.05);\
+        }\
+        .sidebar-brand {\
+            display: flex;\
+            align-items: center;\
+            gap: 12px;\
+            font-size: 1.45rem;\
+            font-weight: 700;\
+            letter-spacing: -0.025em;\
+            margin-bottom: 36px;\
+            color: #fff;\
+            text-transform: uppercase;\
+        }\
+        .sidebar-brand span {\
+            color: var(--primary);\
+        }\
+        .nav-menu {\
+            list-style: none;\
+            display: flex;\
+            flex-direction: column;\
+            gap: 8px;\
+        }\
+        .nav-item {\
+            display: flex;\
+            align-items: center;\
+            gap: 12px;\
+            padding: 12px 16px;\
+            border-radius: var(--radius-md);\
+            color: #94a3b8;\
+            font-weight: 500;\
+            text-decoration: none;\
+            cursor: pointer;\
+            transition: all 0.2s ease;\
+        }\
+        .nav-item:hover, .nav-item.active {\
+            background-color: rgba(255, 255, 255, 0.06);\
+            color: #fff;\
+        }\
+        .nav-item.active {\
+            border-left: 4px solid var(--primary);\
+            background-color: rgba(37, 99, 235, 0.15);\
+        }\
+        .main-content {\
+            flex: 1;\
+            padding: 40px;\
+            overflow-y: auto;\
+            display: flex;\
+            flex-direction: column;\
+            gap: 32px;\
+        }\
+        .header {\
+            display: flex;\
+            justify-content: space-between;\
+            align-items: center;\
+            border-bottom: 1px solid var(--border-color);\
+            padding-bottom: 20px;\
+        }\
+        .header h1 {\
+            font-size: 1.75rem;\
+            font-weight: 700;\
+            letter-spacing: -0.02em;\
+            color: var(--bg-dark);\
+        }\
+        .header p {\
+            color: var(--text-muted);\
+            font-size: 0.9rem;\
+            margin-top: 4px;\
+        }\
+        .sample-selector {\
+            padding: 10px 16px;\
+            font-family: inherit;\
+            font-size: 0.95rem;\
+            font-weight: 600;\
+            color: var(--text-main);\
+            background-color: #fff;\
+            border: 1px solid var(--border-color);\
+            border-radius: var(--radius-md);\
+            outline: none;\
+            cursor: pointer;\
+            box-shadow: var(--shadow-sm);\
+            transition: all 0.2s;\
+        }\
+        .sample-selector:focus {\
+            border-color: var(--primary);\
+        }\
+        .tab-pane {\
+            display: none;\
+            flex-direction: column;\
+            gap: 32px;\
+        }\
+        .tab-pane.active {\
+            display: flex;\
+        }\
+        .kpi-grid {\
+            display: grid;\
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));\
+            gap: 20px;\
+        }\
+        .kpi-card {\
+            background-color: var(--bg-card);\
+            border: 1px solid var(--border-color);\
+            border-radius: var(--radius-lg);\
+            padding: 24px;\
+            box-shadow: var(--shadow-sm);\
+            display: flex;\
+            flex-direction: column;\
+            gap: 12px;\
+            transition: transform 0.2s, box-shadow 0.2s;\
+        }\
+        .kpi-card:hover {\
+            transform: translateY(-2px);\
+            box-shadow: var(--shadow-md);\
+        }\
+        .kpi-title {\
+            font-size: 0.85rem;\
+            font-weight: 600;\
+            text-transform: uppercase;\
+            letter-spacing: 0.05em;\
+            color: var(--text-muted);\
+        }\
+        .kpi-value {\
+            font-size: 1.85rem;\
+            font-weight: 700;\
+            color: var(--bg-dark);\
+        }\
+        .kpi-subtitle {\
+            font-size: 0.8rem;\
+            color: var(--text-muted);\
+        }\
+        .card {\
+            background-color: var(--bg-card);\
+            border: 1px solid var(--border-color);\
+            border-radius: var(--radius-lg);\
+            padding: 28px;\
+            box-shadow: var(--shadow-sm);\
+            display: flex;\
+            flex-direction: column;\
+            gap: 20px;\
+        }\
+        .card-title {\
+            font-size: 1.15rem;\
+            font-weight: 600;\
+            color: var(--bg-dark);\
+            display: flex;\
+            align-items: center;\
+            justify-content: space-between;\
+        }\
+        .chart-container {\
+            position: relative;\
+            min-height: 320px;\
+            width: 100%;\
+        }\
+        .grid-2col {\
+            display: grid;\
+            grid-template-columns: repeat(auto-fit, minmax(480px, 1fr));\
+            gap: 24px;\
+        }\
+        .table-container {\
+            width: 100%;\
+            overflow-x: auto;\
+            border: 1px solid var(--border-color);\
+            border-radius: var(--radius-md);\
+        }\
+        table {\
+            width: 100%;\
+            border-collapse: collapse;\
+            font-size: 0.92rem;\
+            text-align: left;\
+        }\
+        th {\
+            background-color: #f8fafc;\
+            padding: 14px 18px;\
+            font-weight: 600;\
+            color: var(--text-main);\
+            border-bottom: 2px solid var(--border-color);\
+        }\
+        td {\
+            padding: 14px 18px;\
+            border-bottom: 1px solid var(--border-color);\
+            color: var(--text-main);\
+        }\
+        tr:last-child td {\
+            border-bottom: none;\
+        }\
+        .badge {\
+            display: inline-flex;\
+            align-items: center;\
+            gap: 6px;\
+            border-radius: 9999px;\
+            background-color: var(--primary-light);\
+            color: var(--primary);\
+            padding: 4px 12px;\
+            font-size: 0.78rem;\
+            font-weight: 700;\
+            text-transform: uppercase;\
+            letter-spacing: 0.05em;\
+        }\
+        .search-bar {\
+            padding: 12px 18px;\
+            font-family: inherit;\
+            font-size: 0.95rem;\
+            border: 1px solid var(--border-color);\
+            border-radius: var(--radius-md);\
+            outline: none;\
+            width: 100%;\
+            max-width: 400px;\
+            transition: all 0.2s;\
+        }\
+        .search-bar:focus {\
+            border-color: var(--primary);\
+            box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.15);\
+        }\
+        .links-flex {\
+            display: flex;\
+            gap: 12px;\
+            flex-wrap: wrap;\
+        }\
+        .links-flex a {\
+            display: inline-flex;\
+            align-items: center;\
+            gap: 8px;\
+            text-decoration: none;\
+            color: var(--primary);\
+            background-color: var(--primary-light);\
+            border: 1px solid var(--primary-border);\
+            border-radius: var(--radius-md);\
+            padding: 8px 16px;\
+            font-size: 0.88rem;\
+            font-weight: 600;\
+            transition: all 0.2s;\
+        }\
+        .links-flex a:hover {\
+            background-color: var(--primary);\
+            color: #fff;\
+        }\
+        .snapshots-grid {\
+            display: grid;\
+            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));\
+            gap: 20px;\
+        }\
+        .snapshot-card {\
+            border: 1px solid var(--border-color);\
+            border-radius: var(--radius-md);\
+            padding: 16px;\
+            background-color: #f8fbff;\
+            display: flex;\
+            flex-direction: column;\
+            gap: 10px;\
+        }\
+        .snapshot-card a {\
+            color: var(--primary);\
+            text-decoration: none;\
+            font-weight: 700;\
+            font-size: 0.95rem;\
+        }\
+        .snapshot-card .meta {\
+            font-size: 0.82rem;\
+            color: var(--text-muted);\
+        }\
+        pre {\
+            background-color: var(--bg-dark);\
+            color: #e2e8f0;\
+            padding: 20px;\
+            border-radius: var(--radius-md);\
+            overflow-x: auto;\
+            font-family: monospace;\
+            font-size: 0.88rem;\
+        }\
         </style>",
     );
-    out.push_str("</head><body><div class=\"wrap\">");
-    out.push_str(&format!(
-        "<h1>{}</h1><p class=\"sub\">Generated by rs-qc {}</p>",
-        escape_html(&document.title),
-        escape_html(&document.generated_by)
-    ));
-    out.push_str("<div class=\"overview\">");
-    out.push_str(&format!(
-        "<div class=\"stat\"><span class=\"label\">Modules</span><span class=\"value\">{}</span></div>",
-        document.sections.len()
-    ));
-    for (module, count) in module_counts {
-        out.push_str(&format!(
-            "<div class=\"stat\"><span class=\"label\">{}</span><span class=\"value\">{}</span></div>",
-            escape_html(&module),
-            count
-        ));
-    }
+
+    out.push_str("</head><body>");
+
+    // Sidebar
+    out.push_str("<div class=\"sidebar\">");
+    out.push_str("<div class=\"sidebar-brand\">rs-qc<span>.engine</span></div>");
+    out.push_str("<ul class=\"nav-menu\">");
+    out.push_str("<li class=\"nav-item active\" onclick=\"showTab('overview')\">Dashboard Overview</li>");
+    out.push_str("<li class=\"nav-item\" id=\"nav-fastq\" onclick=\"showTab('fastq')\" style=\"display:none;\">FASTQ Metrics</li>");
+    out.push_str("<li class=\"nav-item\" id=\"nav-align\" onclick=\"showTab('align')\" style=\"display:none;\">Alignment Metrics</li>");
+    out.push_str("<li class=\"nav-item\" id=\"nav-dna\" onclick=\"showTab('dna')\" style=\"display:none;\">DNA Coverage</li>");
+    out.push_str("<li class=\"nav-item\" id=\"nav-rna\" onclick=\"showTab('rna')\" style=\"display:none;\">RNA Read Dist</li>");
+    out.push_str("<li class=\"nav-item\" onclick=\"showTab('raw-data')\">Search & Flat Table</li>");
+    out.push_str("</ul>");
     out.push_str("</div>");
 
-    for section in &document.sections {
-        out.push_str("<section class=\"section\">");
-        out.push_str("<div class=\"section-head\">");
-        out.push_str(&format!(
-            "<div><h2 style=\"margin:0\">{}</h2><div class=\"meta\"><span class=\"badge\">{}</span><span>{}</span></div></div>",
-            escape_html(&section.sample),
-            escape_html(&section.module),
-            escape_html(&section.source)
-        ));
-        out.push_str("</div>");
-        let links = artifact_links(section);
-        if !links.is_empty() {
-            out.push_str("<div class=\"links\">");
-            for (label, href) in links {
-                out.push_str(&format!(
-                    "<a href=\"{}\">{}</a>",
-                    escape_html(&href),
-                    escape_html(&label)
-                ));
-            }
-            out.push_str("</div>");
-        }
-        if section.module == "rna" {
-            if let Some((href, alt)) = rna_summary_figure_link(section) {
-                out.push_str("<div class=\"figure\">");
-                out.push_str(&format!(
-                    "<img src=\"{}\" alt=\"{}\">",
-                    escape_html(&href),
-                    escape_html(&alt)
-                ));
-                out.push_str("</div>");
-            }
-        }
-        out.push_str("<table><tbody>");
-        for (key, value) in flatten_summary(&section.metrics, "") {
-            out.push_str(&format!(
-                "<tr><td class=\"key\">{}</td><td>{}</td></tr>",
-                escape_html(&key),
-                escape_html(&value)
-            ));
-        }
-        out.push_str("</tbody></table>");
-        if section.module == "rna" {
-            if let Some(items) = rna_snapshot_items(section) {
-                if !items.is_empty() {
-                    out.push_str("<div class=\"snapshots\">");
-                    for (label, href, meta) in items {
-                        out.push_str("<div class=\"snapshot\">");
-                        out.push_str(&format!(
-                            "<a href=\"{}\">{}</a>",
-                            escape_html(&href),
-                            escape_html(&label)
-                        ));
-                        out.push_str(&format!("<div class=\"meta\">{}</div>", escape_html(&meta)));
-                        out.push_str("</div>");
-                    }
-                    out.push_str("</div>");
-                }
-            }
-        }
-        out.push_str("<details><summary>Raw JSON</summary><pre>");
-        out.push_str(&escape_html(
-            &serde_json::to_string_pretty(&section.metrics).unwrap_or_else(|_| "{}".to_string()),
-        ));
-        out.push_str("</pre></details></section>");
-    }
+    // Main Pane
+    out.push_str("<div class=\"main-content\">");
+    
+    // Header
+    out.push_str("<div class=\"header\">");
+    out.push_str("<div>");
+    out.push_str(&format!("<h1>{}</h1>", escape_html(&document.title)));
+    out.push_str(&format!("<p>Report generated by rs-qc v{}</p>", escape_html(&document.generated_by)));
+    out.push_str("</div>");
+    out.push_str("<select class=\"sample-selector\" id=\"sampleSelect\" onchange=\"onSampleChange()\"></select>");
+    out.push_str("</div>");
 
-    out.push_str("</div></body></html>");
+    // Tabs Container
+    // Tab: Overview
+    out.push_str("<div class=\"tab-pane active\" id=\"tab-overview\">");
+    out.push_str("<div class=\"kpi-grid\" id=\"overviewKpis\"></div>");
+    out.push_str("<div class=\"grid-2col\">");
+    out.push_str("<div class=\"card\"><div class=\"card-title\">Active QC Modules</div><div class=\"table-container\"><table>");
+    out.push_str("<thead><tr><th>Module</th><th>Sample</th><th>Source JSON File</th></tr></thead>");
+    out.push_str("<tbody id=\"overviewModules\"></tbody></table></div></div>");
+    out.push_str("<div class=\"card\"><div class=\"card-title\">Outputs & Export Files</div><div class=\"links-flex\" id=\"overviewLinks\"></div></div>");
+    out.push_str("</div></div>");
+
+    // Tab: FASTQ
+    out.push_str("<div class=\"tab-pane\" id=\"tab-fastq\">");
+    out.push_str("<div class=\"grid-2col\">");
+    out.push_str("<div class=\"card\"><div class=\"card-title\">GC Content Distribution</div><div class=\"chart-container\"><canvas id=\"fastqGcChart\"></canvas></div></div>");
+    out.push_str("<div class=\"card\"><div class=\"card-title\">Mean Quality Distribution</div><div class=\"chart-container\"><canvas id=\"fastqQualChart\"></canvas></div></div>");
+    out.push_str("</div></div>");
+
+    // Tab: Alignment
+    out.push_str("<div class=\"tab-pane\" id=\"tab-align\">");
+    out.push_str("<div class=\"grid-2col\">");
+    out.push_str("<div class=\"card\"><div class=\"card-title\">Insert Size Distribution</div><div class=\"chart-container\"><canvas id=\"alignInsertChart\"></canvas></div></div>");
+    out.push_str("<div class=\"card\"><div class=\"card-title\">MAPQ Score Distribution</div><div class=\"chart-container\"><canvas id=\"alignMapqChart\"></canvas></div></div>");
+    out.push_str("</div></div>");
+
+    // Tab: DNA
+    out.push_str("<div class=\"tab-pane\" id=\"tab-dna\">");
+    out.push_str("<div class=\"grid-2col\">");
+    out.push_str("<div class=\"card\"><div class=\"card-title\">Depth Histogram</div><div class=\"chart-container\"><canvas id=\"dnaDepthChart\"></canvas></div></div>");
+    out.push_str("<div class=\"card\"><div class=\"card-title\">Breadth of Coverage</div><div class=\"table-container\"><table><thead><tr><th>Breadth threshold</th><th>Coverage Percentage</th></tr></thead><tbody id=\"dnaBreadthTable\"></tbody></table></div></div>");
+    out.push_str("</div></div>");
+
+    // Tab: RNA
+    out.push_str("<div class=\"tab-pane\" id=\"tab-rna\">");
+    out.push_str("<div class=\"grid-2col\">");
+    out.push_str("<div class=\"card\"><div class=\"card-title\">Read Distribution Profile</div><div class=\"chart-container\"><canvas id=\"rnaDistChart\"></canvas></div></div>");
+    out.push_str("<div class=\"card\"><div class=\"card-title\">Junction Annotation Summary</div><div class=\"table-container\"><table><thead><tr><th>Junction Class</th><th>Unique Count</th><th>Total Reads</th></tr></thead><tbody id=\"rnaJunctionTable\"></tbody></table></div></div>");
+    out.push_str("</div>");
+    out.push_str("<div class=\"card\"><div class=\"card-title\">Clinical Genomic Snapshots</div><div class=\"snapshots-grid\" id=\"rnaSnapshotsGrid\"></div></div>");
+    out.push_str("</div>");
+
+    // Tab: Raw Data
+    out.push_str("<div class=\"tab-pane\" id=\"tab-raw-data\">");
+    out.push_str("<div class=\"card\">");
+    out.push_str("<div class=\"card-title\">Instant QC Metric Search & Filter <input class=\"search-bar\" id=\"searchBar\" placeholder=\"Search metric key or value...\" oninput=\"onSearch()\"></input></div>");
+    out.push_str("<div class=\"table-container\">");
+    out.push_str("<table><thead><tr><th>Metric Key</th><th>Metric Value</th></tr></thead><tbody id=\"flatMetricsTable\"></tbody></table>");
+    out.push_str("</div></div>");
+    out.push_str("<div class=\"card\"><div class=\"card-title\">Raw Summary Metrics JSON Document</div><pre id=\"rawJsonDisplay\"></pre></div>");
+    out.push_str("</div>");
+
+    out.push_str("</div>"); // Close main-content
+
+    // Inject raw JSON data
+    out.push_str(&format!(
+        "<script>const reportData = {};</script>",
+        safe_json_data
+    ));
+
+    // Dashboard controller logic
+    out.push_str(
+        "<script>\
+        let charts = {};\
+        \
+        function initDashboard() {\
+            const select = document.getElementById('sampleSelect');\
+            const samples = [...new Set(reportData.sections.map(s => s.sample))];\
+            samples.forEach(s => {\
+                const opt = document.createElement('option');\
+                opt.value = s;\
+                opt.textContent = s;\
+                select.appendChild(opt);\
+            });\
+            \
+            // Check which modules are present overall\
+            const modules = new Set(reportData.sections.map(s => s.module));\
+            if (modules.has('fastq')) document.getElementById('nav-fastq').style.display = 'flex';\
+            if (modules.has('align')) document.getElementById('nav-align').style.display = 'flex';\
+            if (modules.has('dna')) document.getElementById('nav-dna').style.display = 'flex';\
+            if (modules.has('rna')) document.getElementById('nav-rna').style.display = 'flex';\
+            \
+            onSampleChange();\
+        }\
+        \
+        function showTab(tabId) {\
+            document.querySelectorAll('.nav-item').forEach(item => item.classList.remove('active'));\
+            document.querySelectorAll('.tab-pane').forEach(pane => pane.classList.remove('active'));\
+            \
+            event.currentTarget.classList.add('active');\
+            document.getElementById('tab-' + tabId).classList.add('active');\
+            \
+            // Re-render active tab charts if needed\
+            renderActiveTabCharts(tabId);\
+        }\
+        \
+        function onSampleChange() {\
+            const sample = document.getElementById('sampleSelect').value;\
+            const sections = reportData.sections.filter(s => s.sample === sample);\
+            \
+            // 1. Populate Overview Modules Table\
+            const modTbody = document.getElementById('overviewModules');\
+            modTbody.innerHTML = '';\
+            sections.forEach(s => {\
+                const tr = document.createElement('tr');\
+                tr.innerHTML = `<td><span class=\"badge\">${s.module}</span></td><td>${s.sample}</td><td>${s.source}</td>`;\
+                modTbody.appendChild(tr);\
+            });\
+            \
+            // 2. Populate Overview Links (dummy files based on prefixes)\
+            const linksDiv = document.getElementById('overviewLinks');\
+            linksDiv.innerHTML = '';\
+            sections.forEach(s => {\
+                const baseName = s.source.substring(s.source.lastIndexOf('/') + 1);\
+                const prefix = baseName.split('.')[0];\
+                const files = [\
+                    { label: 'Summary JSON', ext: '.summary.json' },\
+                    { label: 'Summary TXT/TSV', ext: s.module === 'dna' ? '.dna.summary.tsv' : s.module === 'fastq' ? '.fastq.summary.txt' : s.module === 'align' ? '.align.summary.txt' : '.rna_qc.txt' }\
+                ];\
+                files.forEach(f => {\
+                    const a = document.createElement('a');\
+                    a.href = `./${prefix}${f.ext}`;\
+                    a.target = '_blank';\
+                    a.textContent = `${s.module.toUpperCase()} - ${f.label}`;\
+                    linksDiv.appendChild(a);\
+                });\
+            });\
+            \
+            // 3. Build KPI Cards\
+            buildKpis(sections);\
+            \
+            // 4. Reset Charts\
+            Object.values(charts).forEach(c => c.destroy());\
+            charts = {};\
+            \
+            // 5. Populate Detailed Raw Table & JSON\
+            populateFlatMetrics(sections);\
+            document.getElementById('rawJsonDisplay').textContent = JSON.stringify(sections.map(s => s.metrics), null, 2);\
+            \
+            // 6. Draw current active tab charts\
+            const activeTab = document.querySelector('.nav-item.active').getAttribute('onclick').match(/'([^']+)'/)[1];\
+            renderActiveTabCharts(activeTab);\
+        }\
+        \
+        function buildKpis(sections) {\
+            const grid = document.getElementById('overviewKpis');\
+            grid.innerHTML = '';\
+            \
+            sections.forEach(s => {\
+                const m = s.metrics;\
+                if (s.module === 'fastq') {\
+                    addKpi(grid, 'Total Reads', formatNum(m.total_reads), 'FASTQ QC');\
+                    addKpi(grid, 'Total Bases', formatNum(m.total_bases), 'FASTQ QC');\
+                    if (m.duplication_estimate) {\
+                        addKpi(grid, 'Est. Duplication Rate', (m.duplication_estimate * 100).toFixed(1) + '%', 'FASTQ QC');\
+                    }\
+                } else if (s.module === 'align') {\
+                    addKpi(grid, 'Mapped Records', formatNum(m.mapped_records) + ` (${(m.mapped_records/m.total_records*100).toFixed(1)}%)`, 'Alignment QC');\
+                    if (m.properly_paired_records) {\
+                        addKpi(grid, 'Properly Paired', formatNum(m.properly_paired_records), 'Alignment QC');\
+                    }\
+                    if (m.accuracy && m.accuracy.accuracy_sum) {\
+                        const acc = (m.accuracy.accuracy_sum / m.accuracy.records_with_de * 100).toFixed(2);\
+                        addKpi(grid, 'Alignment Accuracy', acc + '%', 'Alignment QC');\
+                    }\
+                } else if (s.module === 'dna') {\
+                    addKpi(grid, 'Mean Target Depth', m.mean_depth.toFixed(1) + 'x', 'DNA Coverage');\
+                    addKpi(grid, 'Breadth at 10x', (m.breadth_10x * 100).toFixed(1) + '%', 'DNA Coverage');\
+                    addKpi(grid, 'Breadth at 30x', (m.breadth_30x * 100).toFixed(1) + '%', 'DNA Coverage');\
+                } else if (s.module === 'rna') {\
+                    addKpi(grid, 'Aligned QC Reads', formatNum(m.aligned_qc_reads), 'RNA QC');\
+                    addKpi(grid, 'Strandness', m.inferred_strandness, 'RNA QC');\
+                    addKpi(grid, 'Active Genes', formatNum(m.active_genes), 'RNA QC');\
+                }\
+            });\
+        }\
+        \
+        function addKpi(container, title, value, module) {\
+            const card = document.createElement('div');\
+            card.className = 'kpi-card';\
+            card.innerHTML = `<span class=\"kpi-title\">${title}</span><span class=\"kpi-value\">${value}</span><span class=\"kpi-subtitle\">${module}</span>`;\
+            container.appendChild(card);\
+        }\
+        \
+        function formatNum(n) {\
+            if (n === undefined || n === null) return 'NA';\
+            return Number(n).toLocaleString();\
+        }\
+        \
+        function populateFlatMetrics(sections) {\
+            const tbody = document.getElementById('flatMetricsTable');\
+            tbody.innerHTML = '';\
+            sections.forEach(s => {\
+                const flat = flattenObj(s.metrics, s.module);\
+                Object.entries(flat).forEach(([k, v]) => {\
+                    const tr = document.createElement('tr');\
+                    tr.innerHTML = `<td class=\"key\" style=\"font-weight:600;\">${k}</td><td>${v}</td>`;\
+                    tbody.appendChild(tr);\
+                });\
+            });\
+        }\
+        \
+        function flattenObj(val, prefix) {\
+            let res = {};\
+            if (typeof val === 'object' && val !== null) {\
+                if (Array.isArray(val)) {\
+                    res[prefix] = `${val.length} items`;\
+                } else {\
+                    Object.entries(val).forEach(([k, child]) => {\
+                        if (k === 'length_hist' || k === 'gc_hist' || k === 'mean_quality_hist' || k === 'mapq_hist' || k === 'read_length_hist' || k === 'insert_size_hist' || k === 'depth_hist' || k === 'accuracy_hist') {\
+                            // Skip huge histograms in detailed flat table view\
+                            return;\
+                        }\
+                        Object.assign(res, flattenObj(child, `${prefix}.${k}`));\
+                    });\
+                }\
+            } else {\
+                res[prefix] = val === null ? 'NA' : val;\
+            }\
+            return res;\
+        }\
+        \
+        function onSearch() {\
+            const query = document.getElementById('searchBar').value.toLowerCase();\
+            document.querySelectorAll('#flatMetricsTable tr').forEach(tr => {\
+                const text = tr.textContent.toLowerCase();\
+                tr.style.display = text.includes(query) ? '' : 'none';\
+            });\
+        }\
+        \
+        function renderActiveTabCharts(tabId) {\
+            const sample = document.getElementById('sampleSelect').value;\
+            const sections = reportData.sections.filter(s => s.sample === sample);\
+            \
+            if (tabId === 'fastq') {\
+                const sec = sections.find(s => s.module === 'fastq');\
+                if (sec) drawFastqCharts(sec.metrics);\
+            } else if (tabId === 'align') {\
+                const sec = sections.find(s => s.module === 'align');\
+                if (sec) drawAlignCharts(sec.metrics);\
+            } else if (tabId === 'dna') {\
+                const sec = sections.find(s => s.module === 'dna');\
+                if (sec) drawDnaCharts(sec.metrics);\
+            } else if (tabId === 'rna') {\
+                const sec = sections.find(s => s.module === 'rna');\
+                if (sec) drawRnaCharts(sec.metrics);\
+            }\
+        }\
+        \
+        function drawFastqCharts(m) {\
+            if (m.gc_hist && !charts['fastqGc']) {\
+                const ctx = document.getElementById('fastqGcChart').getContext('2d');\
+                const labels = Object.keys(m.gc_hist);\
+                const values = Object.values(m.gc_hist);\
+                charts['fastqGc'] = new Chart(ctx, {\
+                    type: 'line',\
+                    data: {\
+                        labels,\
+                        datasets: [{\
+                            label: 'GC Percentage Count',\
+                            data: values,\
+                            borderColor: '#2563eb',\
+                            backgroundColor: 'rgba(37,99,235,0.05)',\
+                            borderWidth: 2,\
+                            fill: true,\
+                            tension: 0.3\
+                        }]\
+                    },\
+                    options: { responsive: true, maintainAspectRatio: false }\
+                });\
+            }\
+            if (m.mean_quality_hist && !charts['fastqQual']) {\
+                const ctx = document.getElementById('fastqQualChart').getContext('2d');\
+                const labels = Object.keys(m.mean_quality_hist);\
+                const values = Object.values(m.mean_quality_hist);\
+                charts['fastqQual'] = new Chart(ctx, {\
+                    type: 'bar',\
+                    data: {\
+                        labels,\
+                        datasets: [{\
+                            label: 'Mean Quality Score Count',\
+                            data: values,\
+                            backgroundColor: '#10b981'\
+                        }]\
+                    },\
+                    options: { responsive: true, maintainAspectRatio: false }\
+                });\
+            }\
+        }\
+        \
+        function drawAlignCharts(m) {\
+            if (m.insert_size_hist && !charts['alignInsert']) {\
+                const ctx = document.getElementById('alignInsertChart').getContext('2d');\
+                const labels = Object.keys(m.insert_size_hist);\
+                const values = Object.values(m.insert_size_hist);\
+                charts['alignInsert'] = new Chart(ctx, {\
+                    type: 'line',\
+                    data: {\
+                        labels,\
+                        datasets: [{\
+                            label: 'Insert Size Count',\
+                            data: values,\
+                            borderColor: '#2563eb',\
+                            backgroundColor: 'rgba(37,99,235,0.05)',\
+                            borderWidth: 2,\
+                            fill: true,\
+                            tension: 0.3\
+                        }]\
+                    },\
+                    options: { responsive: true, maintainAspectRatio: false }\
+                });\
+            }\
+            if (m.mapq_hist && !charts['alignMapq']) {\
+                const ctx = document.getElementById('alignMapqChart').getContext('2d');\
+                const labels = Object.keys(m.mapq_hist);\
+                const values = Object.values(m.mapq_hist);\
+                charts['alignMapq'] = new Chart(ctx, {\
+                    type: 'bar',\
+                    data: {\
+                        labels,\
+                        datasets: [{\
+                            label: 'MAPQ Count',\
+                            data: values,\
+                            backgroundColor: '#1e293b'\
+                        }]\
+                    },\
+                    options: { responsive: true, maintainAspectRatio: false }\
+                });\
+            }\
+        }\
+        \
+        function drawDnaCharts(m) {\
+            if (m.depth_hist && !charts['dnaDepth']) {\
+                const ctx = document.getElementById('dnaDepthChart').getContext('2d');\
+                const labels = Object.keys(m.depth_hist);\
+                const values = Object.values(m.depth_hist);\
+                charts['dnaDepth'] = new Chart(ctx, {\
+                    type: 'bar',\
+                    data: {\
+                        labels,\
+                        datasets: [{\
+                            label: 'Depth Count',\
+                            data: values,\
+                            backgroundColor: '#2563eb'\
+                        }]\
+                    },\
+                    options: { responsive: true, maintainAspectRatio: false }\
+                });\
+            }\
+            \
+            // Populate DNA Breadth table\
+            const tbody = document.getElementById('dnaBreadthTable');\
+            tbody.innerHTML = `\
+                <tr><td>1x</td><td>${(m.breadth_1x*100).toFixed(2)}%</td></tr>\
+                <tr><td>5x</td><td>${(m.breadth_5x*100).toFixed(2)}%</td></tr>\
+                <tr><td>10x</td><td>${(m.breadth_10x*100).toFixed(2)}%</td></tr>\
+                <tr><td>20x</td><td>${(m.breadth_20x*100).toFixed(2)}%</td></tr>\
+                <tr><td>30x</td><td>${(m.breadth_30x*100).toFixed(2)}%</td></tr>\
+            `;\
+        }\
+        \
+        function drawRnaCharts(m) {\
+            if (!charts['rnaDist']) {\
+                const ctx = document.getElementById('rnaDistChart').getContext('2d');\
+                charts['rnaDist'] = new Chart(ctx, {\
+                    type: 'doughnut',\
+                    data: {\
+                        labels: ['Exonic', 'Intronic', 'Flanking', 'Intergenic'],\
+                        datasets: [{\
+                            data: [m.exonic_reads, m.intronic_reads, m.flanking_reads, m.intergenic_reads],\
+                            backgroundColor: ['#10b981', '#f59e0b', '#3b82f6', '#94a3b8']\
+                        }]\
+                    },\
+                    options: { responsive: true, maintainAspectRatio: false }\
+                });\
+            }\
+            \
+            // Populate Junction Table\
+            const tbody = document.getElementById('rnaJunctionTable');\
+            tbody.innerHTML = `\
+                <tr><td>Known Junctions</td><td>${m.unique_known_junctions || 0}</td><td>${m.total_known_junction_reads || 0}</td></tr>\
+                <tr><td>Partial Novel Junctions</td><td>${m.unique_partial_novel_junctions || 0}</td><td>${m.total_partial_novel_junction_reads || 0}</td></tr>\
+                <tr><td>Fully Novel Junctions</td><td>${m.unique_novel_junctions || 0}</td><td>${m.total_novel_junction_reads || 0}</td></tr>\
+            `;\
+            \
+            // Render Clinical Genomic Snapshots gallery if available\
+            const snapGrid = document.getElementById('rnaSnapshotsGrid');\
+            snapGrid.innerHTML = '';\
+            const baseName = reportData.sections.find(s => s.module === 'rna').source.substring(reportData.sections.find(s => s.module === 'rna').source.lastIndexOf('/') + 1);\
+            const prefix = baseName.split('.')[0];\
+            const snaps = [\
+                { gene: 'GAPDH', file: `${prefix}.GAPDH.png`, reason: 'Housekeeping Gene Body' }\
+            ];\
+            snaps.forEach(s => {\
+                const card = document.createElement('div');\
+                card.className = 'snapshot-card';\
+                card.innerHTML = `<a href=\"./snapshots/${s.file}\" target=\"_blank\">${s.gene} Snapshot</a><span class=\"meta\">${s.reason}</span>`;\
+                snapGrid.appendChild(card);\
+            });\
+        }\
+        \
+        window.onload = initDashboard;\
+        </script>",
+    );
+
+    out.push_str("</body></html>");
     out
 }
 
