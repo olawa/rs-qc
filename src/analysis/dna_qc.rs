@@ -32,6 +32,20 @@ pub struct DnaQcConfig {
     pub show_progress: bool,
 }
 
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+pub struct GcBiasBin {
+    pub gc_fraction: f64,
+    pub window_count: u64,
+    pub mean_depth: f64,
+    pub normalized_coverage: f64,
+    pub standard_error: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+pub struct GcBiasMetrics {
+    pub bins: Vec<GcBiasBin>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct DnaQcMetrics {
     pub total_records: u64,
@@ -45,6 +59,7 @@ pub struct DnaQcMetrics {
     pub targets: BTreeMap<String, DnaTargetAccumulator>,
     pub target_bed: Option<String>,
     pub window_size: u32,
+    pub gc_bias: Option<GcBiasMetrics>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -109,6 +124,7 @@ pub struct DnaQcSummary {
     pub targets: Vec<DnaTargetAccumulator>,
     pub target_bed: Option<String>,
     pub window_size: u32,
+    pub gc_bias: Option<GcBiasMetrics>,
 }
 
 #[derive(Debug, Clone)]
@@ -166,6 +182,7 @@ impl DnaQcMetrics {
             targets: self.targets.values().cloned().collect(),
             target_bed: self.target_bed.clone(),
             window_size: self.window_size,
+            gc_bias: self.gc_bias.clone(),
         }
     }
 
@@ -183,6 +200,10 @@ impl DnaQcMetrics {
         merge_accumulator_maps(&mut self.contigs, other.contigs);
         merge_accumulator_maps(&mut self.windows, other.windows);
         merge_accumulator_maps(&mut self.targets, other.targets);
+
+        if self.gc_bias.is_none() {
+            self.gc_bias = other.gc_bias;
+        }
     }
 }
 
@@ -281,6 +302,12 @@ pub fn run_dna_qc(config: &DnaQcConfig) -> Result<DnaQcMetrics> {
         let file_metrics = scan_dna_file(input, config)
             .with_context(|| format!("failed while scanning DNA input {input}"))?;
         metrics.merge(file_metrics);
+    }
+
+    if let Some(ref ref_fasta) = config.reference_fasta {
+        println!("Calculating GC Bias metrics using reference FASTA: {}", ref_fasta);
+        let gc_bias = compute_gc_bias(ref_fasta, &metrics.windows)?;
+        metrics.gc_bias = Some(gc_bias);
     }
 
     write_outputs(config, &metrics)?;
@@ -720,6 +747,9 @@ fn write_outputs(config: &DnaQcConfig, metrics: &DnaQcMetrics) -> Result<()> {
     write_contigs(config, &summary)?;
     write_windows(config, &summary)?;
     write_targets(config, &summary)?;
+    if let Some(ref gc) = metrics.gc_bias {
+        write_gc_bias(config, gc)?;
+    }
     write_summary_json(
         &format!("{}.dna.summary.json", config.output_prefix),
         "dna",
@@ -864,5 +894,267 @@ fn pct(n: u64, total: u64) -> f64 {
         0.0
     } else {
         n as f64 * 100.0 / total as f64
+    }
+}
+
+pub fn compute_gc_bias(
+    reference_fasta: &str,
+    windows: &BTreeMap<String, DnaWindowAccumulator>,
+) -> Result<GcBiasMetrics> {
+    let mut reader = noodles::fasta::io::indexed_reader::Builder::default()
+        .build_from_path(reference_fasta)
+        .with_context(|| format!("could not open indexed FASTA {} (make sure the .fai index file exists)", reference_fasta))?;
+
+    let mut gc_bin_depths: Vec<Vec<f64>> = vec![Vec::new(); 101];
+
+    for window in windows.values() {
+        let len = window.end - window.start;
+        if len == 0 {
+            continue;
+        }
+
+        if let Some(seq) = get_fasta_sequence(&mut reader, &window.chrom, window.start, window.end) {
+            let mut gc_count = 0;
+            let mut at_count = 0;
+            for &b in &seq {
+                match b.to_ascii_uppercase() {
+                    b'G' | b'C' => gc_count += 1,
+                    b'A' | b'T' | b'U' => at_count += 1,
+                    _ => {}
+                }
+            }
+            let total = gc_count + at_count;
+            if total > 0 {
+                let gc_frac = gc_count as f64 / total as f64;
+                let bin_idx = (gc_frac * 100.0).round() as usize;
+                let bin_idx = bin_idx.min(100);
+
+                let mean_depth = window.depth_bases as f64 / len as f64;
+                gc_bin_depths[bin_idx].push(mean_depth);
+            }
+        }
+    }
+
+    let all_depths: Vec<f64> = gc_bin_depths.iter().flatten().copied().collect();
+    let total_windows = all_depths.len() as u64;
+    let global_mean_depth = if total_windows == 0 {
+        0.0
+    } else {
+        all_depths.iter().sum::<f64>() / total_windows as f64
+    };
+
+    let mut bins = Vec::with_capacity(101);
+    for (gc_idx, depths) in gc_bin_depths.iter().enumerate() {
+        let count = depths.len() as u64;
+        let (mean_depth, normalized_coverage, standard_error) = if count == 0 {
+            (0.0, 0.0, 0.0)
+        } else {
+            let sum: f64 = depths.iter().sum();
+            let mean = sum / count as f64;
+
+            let norm_cov = if global_mean_depth > 0.0 {
+                mean / global_mean_depth
+            } else {
+                0.0
+            };
+
+            let se = if count > 1 {
+                let variance_sum: f64 = depths.iter().map(|&d| (d - mean).powi(2)).sum();
+                let variance = variance_sum / (count - 1) as f64;
+                variance.sqrt() / (count as f64).sqrt()
+            } else {
+                0.0
+            };
+
+            (mean, norm_cov, se)
+        };
+
+        bins.push(GcBiasBin {
+            gc_fraction: gc_idx as f64 / 100.0,
+            window_count: count,
+            mean_depth,
+            normalized_coverage,
+            standard_error,
+        });
+    }
+
+    // Run premium validation check outputs in the console
+    let warnings = run_gc_bias_validation(&bins);
+    if !warnings.is_empty() {
+        println!("  [WARNING] DNA GC Bias Validation warnings found:");
+        for w in &warnings {
+            println!("    - {}", w);
+        }
+    } else {
+        println!("  - DNA GC Bias Validation: PASS (no extreme GC or AT coverage drop-offs detected)");
+    }
+
+    Ok(GcBiasMetrics { bins })
+}
+
+fn get_fasta_sequence<R>(
+    reader: &mut noodles::fasta::io::indexed_reader::IndexedReader<R>,
+    chrom: &str,
+    start: u64,
+    end: u64,
+) -> Option<Vec<u8>>
+where
+    R: std::io::BufRead + std::io::Seek,
+{
+    let trimmed = chrom.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let no_chr = lower.strip_prefix("chr").unwrap_or(&lower);
+    let canonical_with_chr = format!("chr{}", no_chr);
+    let canonical_without_chr = no_chr.to_string();
+
+    let aliases = vec![
+        trimmed.to_string(),
+        canonical_with_chr,
+        canonical_without_chr,
+    ];
+
+    for alias in aliases {
+        let region_str = format!("{}:{}-{}", alias, start + 1, end);
+        if let Ok(region) = region_str.parse() {
+            if let Ok(rec) = reader.query(&region) {
+                return Some(rec.sequence().as_ref().to_vec());
+            }
+        }
+    }
+    None
+}
+
+pub fn run_gc_bias_validation(bins: &[GcBiasBin]) -> Vec<String> {
+    let mut warnings = Vec::new();
+
+    // Check AT-rich regions (e.g. GC bin 20%-25%)
+    let mut at_sum = 0.0;
+    let mut at_count = 0;
+    for bin in bins {
+        let pct = (bin.gc_fraction * 100.0).round() as u32;
+        if (20..=25).contains(&pct) && bin.window_count > 0 {
+            at_sum += bin.normalized_coverage;
+            at_count += 1;
+        }
+    }
+    if at_count > 0 {
+        let at_avg = at_sum / at_count as f64;
+        if at_avg < 0.5 {
+            warnings.push(format!("AT-rich regions (20-25% GC) have extremely depleted coverage: {:.2}x normalized", at_avg));
+        } else if at_avg > 1.8 {
+            warnings.push(format!("AT-rich regions (20-25% GC) have extreme coverage spikes: {:.2}x normalized", at_avg));
+        }
+    }
+
+    // Check GC-rich regions (e.g. GC bin 60%-65%)
+    let mut gc_sum = 0.0;
+    let mut gc_count = 0;
+    for bin in bins {
+        let pct = (bin.gc_fraction * 100.0).round() as u32;
+        if (60..=65).contains(&pct) && bin.window_count > 0 {
+            gc_sum += bin.normalized_coverage;
+            gc_count += 1;
+        }
+    }
+    if gc_count > 0 {
+        let gc_avg = gc_sum / gc_count as f64;
+        if gc_avg < 0.5 {
+            warnings.push(format!("GC-rich regions (60-65% GC) have extremely depleted coverage: {:.2}x normalized", gc_avg));
+        } else if gc_avg > 1.8 {
+            warnings.push(format!("GC-rich regions (60-65% GC) have extreme coverage spikes: {:.2}x normalized", gc_avg));
+        }
+    }
+
+    // Check overall standard error mean across bins that contain windows
+    let mut total_se = 0.0;
+    let mut bins_with_windows = 0;
+    for bin in bins {
+        if bin.window_count > 1 {
+            total_se += bin.standard_error;
+            bins_with_windows += 1;
+        }
+    }
+    if bins_with_windows > 0 {
+        let avg_se = total_se / bins_with_windows as f64;
+        if avg_se > 0.15 {
+            warnings.push(format!("High average standard error across GC bins ({:.4}): depth estimates within GC groups are highly variable/noisy", avg_se));
+        }
+    }
+
+    warnings
+}
+
+fn write_gc_bias(config: &DnaQcConfig, metrics: &GcBiasMetrics) -> Result<()> {
+    let mut out = File::create(format!("{}.dna.gc_bias.tsv", config.output_prefix))?;
+    writeln!(
+        out,
+        "gc_fraction\twindow_count\tmean_depth\tnormalized_coverage\tstandard_error"
+    )?;
+    for bin in &metrics.bins {
+        writeln!(
+            out,
+            "{:.2}\t{}\t{:.6}\t{:.6}\t{:.6}",
+            bin.gc_fraction,
+            bin.window_count,
+            bin.mean_depth,
+            bin.normalized_coverage,
+            bin.standard_error
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_gc_bias_validation() {
+        // 1. Pass case
+        let mut normal_bins = Vec::new();
+        for i in 0..=100 {
+            normal_bins.push(GcBiasBin {
+                gc_fraction: i as f64 / 100.0,
+                window_count: 5,
+                mean_depth: 30.0,
+                normalized_coverage: 1.0,
+                standard_error: 0.02,
+            });
+        }
+        let pass_warnings = run_gc_bias_validation(&normal_bins);
+        assert!(pass_warnings.is_empty(), "Expected no warnings for uniform coverage");
+
+        // 2. AT depletion case (GC bin 20%-25% having low normalized coverage)
+        let mut at_depleted_bins = normal_bins.clone();
+        for bin in &mut at_depleted_bins {
+            let pct = (bin.gc_fraction * 100.0).round() as u32;
+            if (20..=25).contains(&pct) {
+                bin.normalized_coverage = 0.4;
+            }
+        }
+        let at_warnings = run_gc_bias_validation(&at_depleted_bins);
+        assert!(!at_warnings.is_empty());
+        assert!(at_warnings[0].contains("AT-rich"));
+
+        // 3. GC depletion case (GC bin 60%-65% having low normalized coverage)
+        let mut gc_depleted_bins = normal_bins.clone();
+        for bin in &mut gc_depleted_bins {
+            let pct = (bin.gc_fraction * 100.0).round() as u32;
+            if (60..=65).contains(&pct) {
+                bin.normalized_coverage = 0.3;
+            }
+        }
+        let gc_warnings = run_gc_bias_validation(&gc_depleted_bins);
+        assert!(!gc_warnings.is_empty());
+        assert!(gc_warnings[0].contains("GC-rich"));
+
+        // 4. High standard error case
+        let mut noisy_bins = normal_bins.clone();
+        for bin in &mut noisy_bins {
+            bin.standard_error = 0.25;
+        }
+        let noisy_warnings = run_gc_bias_validation(&noisy_bins);
+        assert!(!noisy_warnings.is_empty());
+        assert!(noisy_warnings[0].contains("standard error"));
     }
 }
