@@ -656,16 +656,17 @@ impl FastqBatchProducer {
                         };
                     }
 
-                    // Periodic stderr progress update
+                    // Periodic stderr progress update (carriage return overwrite)
                     let report_threshold = 1_000_000;
                     if self.observed_reads >= self.last_progress + report_threshold {
                         self.last_progress = (self.observed_reads / report_threshold) * report_threshold;
                         let elapsed = self.start_time.elapsed().as_secs_f64();
                         let speed = if elapsed > 0.0 { self.observed_reads as f64 / elapsed } else { 0.0 };
-                        eprintln!(
-                            "  - Processed {} reads ({:.0} reads/s)...",
+                        eprint!(
+                            "\r  - Processed {} reads ({:.0} reads/s)...",
                             self.observed_reads, speed
                         );
+                        let _ = std::io::stderr().flush();
                     }
                 }
                 None => break,
@@ -678,6 +679,13 @@ impl FastqBatchProducer {
                 .send(FastqWorkItem::Single(batch))
                 .map_err(|_| anyhow::anyhow!("FASTQ workers stopped receiving batches"))?;
         }
+        // Print final status and newline
+        let elapsed = self.start_time.elapsed().as_secs_f64();
+        let speed = if elapsed > 0.0 { self.observed_reads as f64 / elapsed } else { 0.0 };
+        eprintln!(
+            "\r  - Processed {} reads ({:.0} reads/s)... Completed.",
+            self.observed_reads, speed
+        );
         Ok(())
     }
 
@@ -726,16 +734,17 @@ impl FastqBatchProducer {
                         };
                     }
 
-                    // Periodic stderr progress update
+                    // Periodic stderr progress update (carriage return overwrite)
                     let report_threshold = 1_000_000;
                     if self.observed_reads >= self.last_progress + report_threshold {
                         self.last_progress = (self.observed_reads / report_threshold) * report_threshold;
                         let elapsed = self.start_time.elapsed().as_secs_f64();
                         let speed = if elapsed > 0.0 { self.observed_reads as f64 / elapsed } else { 0.0 };
-                        eprintln!(
-                            "  - Processed {} reads ({:.0} reads/s)...",
+                        eprint!(
+                            "\r  - Processed {} reads ({:.0} reads/s)...",
                             self.observed_reads, speed
                         );
+                        let _ = std::io::stderr().flush();
                     }
                 }
             }
@@ -748,6 +757,13 @@ impl FastqBatchProducer {
                 .send(FastqWorkItem::Paired(batch))
                 .map_err(|_| anyhow::anyhow!("FASTQ workers stopped receiving batches"))?;
         }
+        // Print final status and newline
+        let elapsed = self.start_time.elapsed().as_secs_f64();
+        let speed = if elapsed > 0.0 { self.observed_reads as f64 / elapsed } else { 0.0 };
+        eprintln!(
+            "\r  - Processed {} reads ({:.0} reads/s)... Completed.",
+            self.observed_reads, speed
+        );
         Ok(())
     }
 }
