@@ -523,7 +523,7 @@ fn scan_fastq_single(
     observed_reads: u64,
 ) -> Result<(FastqQcMetrics, u64)> {
     let reader = BufReader::with_capacity(
-        1 << 20,
+        4 << 20, // 4MB buffer for maximum I/O performance
         open_fastq_reader(path, config.use_pigz, config.pigz_threads)?,
     );
     let producer = FastqBatchProducer::new_single(reader, config, observed_reads)?;
@@ -536,11 +536,11 @@ fn scan_fastq_pairs(
     config: &FastqQcConfig,
 ) -> Result<FastqQcMetrics> {
     let left = BufReader::with_capacity(
-        1 << 20,
+        4 << 20, // 4MB buffer
         open_fastq_reader(left_path, config.use_pigz, config.pigz_threads)?,
     );
     let right = BufReader::with_capacity(
-        1 << 20,
+        4 << 20, // 4MB buffer
         open_fastq_reader(right_path, config.use_pigz, config.pigz_threads)?,
     );
     let producer = FastqBatchProducer::new_paired(left, right, config, 0)?;
@@ -555,6 +555,8 @@ struct FastqBatchProducer {
     observed_reads: u64,
     tx: Option<mpsc::SyncSender<FastqWorkItem>>,
     rx: Arc<Mutex<mpsc::Receiver<FastqWorkItem>>>,
+    start_time: std::time::Instant,
+    last_progress: u64,
 }
 
 impl FastqBatchProducer {
@@ -584,6 +586,7 @@ impl FastqBatchProducer {
         let worker_threads = worker_thread_count(config);
         let queue_capacity = worker_threads.saturating_mul(2).max(1);
         let (tx, rx) = mpsc::sync_channel(queue_capacity);
+        let start_time = std::time::Instant::now();
         Ok(Self {
             left,
             right,
@@ -591,6 +594,8 @@ impl FastqBatchProducer {
             observed_reads,
             tx: Some(tx),
             rx: Arc::new(Mutex::new(rx)),
+            start_time,
+            last_progress: 0,
         })
     }
 
@@ -650,6 +655,18 @@ impl FastqBatchProducer {
                             records: Vec::with_capacity(self.config.batch_size.max(1)),
                         };
                     }
+
+                    // Periodic stderr progress update
+                    let report_threshold = 1_000_000;
+                    if self.observed_reads >= self.last_progress + report_threshold {
+                        self.last_progress = (self.observed_reads / report_threshold) * report_threshold;
+                        let elapsed = self.start_time.elapsed().as_secs_f64();
+                        let speed = if elapsed > 0.0 { self.observed_reads as f64 / elapsed } else { 0.0 };
+                        eprintln!(
+                            "  - Processed {} reads ({:.0} reads/s)...",
+                            self.observed_reads, speed
+                        );
+                    }
                 }
                 None => break,
             }
@@ -707,6 +724,18 @@ impl FastqBatchProducer {
                             left: Vec::with_capacity(self.config.batch_size.max(1)),
                             right: Vec::with_capacity(self.config.batch_size.max(1)),
                         };
+                    }
+
+                    // Periodic stderr progress update
+                    let report_threshold = 1_000_000;
+                    if self.observed_reads >= self.last_progress + report_threshold {
+                        self.last_progress = (self.observed_reads / report_threshold) * report_threshold;
+                        let elapsed = self.start_time.elapsed().as_secs_f64();
+                        let speed = if elapsed > 0.0 { self.observed_reads as f64 / elapsed } else { 0.0 };
+                        eprintln!(
+                            "  - Processed {} reads ({:.0} reads/s)...",
+                            self.observed_reads, speed
+                        );
                     }
                 }
             }
