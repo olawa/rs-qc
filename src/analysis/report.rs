@@ -499,12 +499,12 @@ fn render_html(document: &ReportDocument) -> String {
     out.push_str("<div class=\"sidebar\">");
     out.push_str("<div class=\"sidebar-brand\">rs-qc<span>.engine</span></div>");
     out.push_str("<ul class=\"nav-menu\">");
-    out.push_str("<li class=\"nav-item active\" onclick=\"showTab('overview')\">Dashboard Overview</li>");
-    out.push_str("<li class=\"nav-item\" id=\"nav-fastq\" onclick=\"showTab('fastq')\" style=\"display:none;\">FASTQ Metrics</li>");
-    out.push_str("<li class=\"nav-item\" id=\"nav-align\" onclick=\"showTab('align')\" style=\"display:none;\">Alignment Metrics</li>");
-    out.push_str("<li class=\"nav-item\" id=\"nav-dna\" onclick=\"showTab('dna')\" style=\"display:none;\">DNA Coverage</li>");
-    out.push_str("<li class=\"nav-item\" id=\"nav-rna\" onclick=\"showTab('rna')\" style=\"display:none;\">RNA Read Dist</li>");
-    out.push_str("<li class=\"nav-item\" onclick=\"showTab('raw-data')\">Search & Flat Table</li>");
+    out.push_str("<li class=\"nav-item active\" data-tab=\"overview\" onclick=\"showTab('overview')\">Dashboard Overview</li>");
+    out.push_str("<li class=\"nav-item\" id=\"nav-fastq\" data-tab=\"fastq\" onclick=\"showTab('fastq')\" style=\"display:none;\">FASTQ Metrics</li>");
+    out.push_str("<li class=\"nav-item\" id=\"nav-align\" data-tab=\"align\" onclick=\"showTab('align')\" style=\"display:none;\">Alignment Metrics</li>");
+    out.push_str("<li class=\"nav-item\" id=\"nav-dna\" data-tab=\"dna\" onclick=\"showTab('dna')\" style=\"display:none;\">DNA Coverage</li>");
+    out.push_str("<li class=\"nav-item\" id=\"nav-rna\" data-tab=\"rna\" onclick=\"showTab('rna')\" style=\"display:none;\">RNA Read Dist</li>");
+    out.push_str("<li class=\"nav-item\" data-tab=\"raw-data\" onclick=\"showTab('raw-data')\">Search & Flat Table</li>");
     out.push_str("</ul>");
     out.push_str("</div>");
 
@@ -608,8 +608,11 @@ fn render_html(document: &ReportDocument) -> String {
             document.querySelectorAll('.nav-item').forEach(item => item.classList.remove('active'));\
             document.querySelectorAll('.tab-pane').forEach(pane => pane.classList.remove('active'));\
             \
-            event.currentTarget.classList.add('active');\
-            document.getElementById('tab-' + tabId).classList.add('active');\
+            const activeNav = document.querySelector(`.nav-item[data-tab=\"${tabId}\"]`);\
+            if (activeNav) activeNav.classList.add('active');\
+            \
+            const activePane = document.getElementById('tab-' + tabId);\
+            if (activePane) activePane.classList.add('active');\
             \
             // Re-render active tab charts if needed\
             renderActiveTabCharts(tabId);\
@@ -659,7 +662,7 @@ fn render_html(document: &ReportDocument) -> String {
             document.getElementById('rawJsonDisplay').textContent = JSON.stringify(sections.map(s => s.metrics), null, 2);\
             \
             // 6. Draw current active tab charts\
-            const activeTab = document.querySelector('.nav-item.active').getAttribute('onclick').match(/'([^']+)'/)[1];\
+            const activeTab = document.querySelector('.nav-item.active').getAttribute('data-tab');\
             renderActiveTabCharts(activeTab);\
         }\
         \
