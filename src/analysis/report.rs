@@ -167,8 +167,30 @@ fn push_unique(files: &mut Vec<PathBuf>, candidate: PathBuf) {
     }
 }
 
+fn prune_heavy_fields(val: &mut serde_json::Value) {
+    match val {
+        serde_json::Value::Object(map) => {
+            map.remove("kmers");
+            map.remove("overrepresented_bytes");
+            map.remove("overrepresented");
+            map.remove("per_base");
+            for v in map.values_mut() {
+                prune_heavy_fields(v);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                prune_heavy_fields(v);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn render_html(document: &ReportDocument) -> String {
-    let json_data = serde_json::to_string(document).unwrap_or_else(|_| "{}".to_string());
+    let mut val = serde_json::to_value(document).unwrap_or(serde_json::Value::Null);
+    prune_heavy_fields(&mut val);
+    let json_data = serde_json::to_string(&val).unwrap_or_else(|_| "{}".to_string());
     let safe_json_data = json_data.replace("</script>", "<\\/script>");
 
     let mut out = String::new();
@@ -176,11 +198,11 @@ fn render_html(document: &ReportDocument) -> String {
     out.push_str("<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">");
     out.push_str("<title>rs-qc Interactive Dashboard</title>");
     
-    // Inject OutFit Google Font and Chart.js from CDN
+    // Inject OutFit Google Font and Chart.js from CDN (deferred to prevent offline hanging)
     out.push_str("<link rel=\"preconnect\" href=\"https://fonts.googleapis.com\">");
     out.push_str("<link rel=\"preconnect\" href=\"https://fonts.gstatic.com\" crossorigin>");
     out.push_str("<link href=\"https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=Plus+Jakarta+Sans:wght@300;400;500;600;700&display=swap\" rel=\"stylesheet\">");
-    out.push_str("<script src=\"https://cdn.jsdelivr.net/npm/chart.js\"></script>");
+    out.push_str("<script src=\"https://cdn.jsdelivr.net/npm/chart.js\" defer></script>");
 
     // Sleek modern styling
     out.push_str(
@@ -373,6 +395,11 @@ fn render_html(document: &ReportDocument) -> String {
             position: relative;\
             min-height: 320px;\
             width: 100%;\
+        }\
+        .chart-container canvas {\
+            width: 100%;\
+            height: 100%;\
+            display: block;\
         }\
         .grid-2col {\
             display: grid;\
@@ -752,8 +779,12 @@ fn render_html(document: &ReportDocument) -> String {
             });\
         }\
         \
-        function renderActiveTabCharts(tabId) {\
-            const sample = document.getElementById('sampleSelect').value;\
+        function renderActiveTabCharts(tabId) {
+            if (typeof Chart === 'undefined') {
+                console.warn('Chart.js is not loaded (running offline). Charts will not be drawn.');
+                return;
+            }
+            const sample = document.getElementById('sampleSelect').value;
             const sections = reportData.sections.filter(s => s.sample === sample);\
             \
             if (tabId === 'fastq') {\
@@ -925,6 +956,306 @@ fn render_html(document: &ReportDocument) -> String {
         \
         window.onload = initDashboard;\
         </script>",
+    );
+
+    out.push_str(
+        r##"<script>
+        function fitCanvas(canvas) {
+            const rect = canvas.getBoundingClientRect();
+            const width = Math.max(1, Math.round(rect.width || canvas.clientWidth || 300));
+            const height = Math.max(1, Math.round(rect.height || canvas.clientHeight || 240));
+            const dpr = window.devicePixelRatio || 1;
+            canvas.width = Math.round(width * dpr);
+            canvas.height = Math.round(height * dpr);
+            const ctx = canvas.getContext('2d');
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            return { ctx, width, height };
+        }
+
+        function clearCanvas(canvas) {
+            const { ctx, width, height } = fitCanvas(canvas);
+            ctx.clearRect(0, 0, width, height);
+            return { ctx, width, height };
+        }
+
+        function drawGridAxes(ctx, width, height, margin, maxValue, tickCount) {
+            ctx.save();
+            ctx.strokeStyle = '#e2e8f0';
+            ctx.fillStyle = '#64748b';
+            ctx.lineWidth = 1;
+            ctx.font = '12px sans-serif';
+            ctx.textBaseline = 'middle';
+
+            const plotWidth = width - margin.left - margin.right;
+            const plotHeight = height - margin.top - margin.bottom;
+            const safeMax = Math.max(maxValue, 1);
+
+            for (let i = 0; i <= tickCount; i++) {
+                const ratio = i / tickCount;
+                const y = margin.top + plotHeight - ratio * plotHeight;
+                ctx.beginPath();
+                ctx.moveTo(margin.left, y);
+                ctx.lineTo(width - margin.right, y);
+                ctx.stroke();
+                ctx.fillText(Math.round(safeMax * ratio).toLocaleString(), 8, y);
+            }
+
+            ctx.strokeStyle = '#0f172a';
+            ctx.beginPath();
+            ctx.moveTo(margin.left, margin.top);
+            ctx.lineTo(margin.left, height - margin.bottom);
+            ctx.lineTo(width - margin.right, height - margin.bottom);
+            ctx.stroke();
+
+            ctx.restore();
+        }
+
+        function drawLineFallback(canvasId, labels, values, color, fill) {
+            const canvas = document.getElementById(canvasId);
+            if (!canvas) return;
+            const { ctx, width, height } = clearCanvas(canvas);
+            const margin = { top: 18, right: 18, bottom: 36, left: 48 };
+            const plotWidth = width - margin.left - margin.right;
+            const plotHeight = height - margin.top - margin.bottom;
+            const nums = values.map(v => Number(v) || 0);
+            const maxValue = Math.max(1, ...nums);
+            const step = nums.length > 12 ? Math.ceil(nums.length / 10) : 1;
+
+            drawGridAxes(ctx, width, height, margin, maxValue, 5);
+
+            if (nums.length === 0) return;
+
+            const points = nums.map((value, index) => {
+                const x = margin.left + (nums.length === 1 ? plotWidth / 2 : (index / (nums.length - 1)) * plotWidth);
+                const y = margin.top + plotHeight - (value / maxValue) * plotHeight;
+                return { x, y, value };
+            });
+
+            if (fill) {
+                ctx.beginPath();
+                ctx.moveTo(points[0].x, margin.top + plotHeight);
+                points.forEach((point, index) => {
+                    if (index === 0) {
+                        ctx.lineTo(point.x, point.y);
+                    } else {
+                        ctx.lineTo(point.x, point.y);
+                    }
+                });
+                ctx.lineTo(points[points.length - 1].x, margin.top + plotHeight);
+                ctx.closePath();
+                ctx.fillStyle = 'rgba(37, 99, 235, 0.08)';
+                ctx.fill();
+            }
+
+            ctx.beginPath();
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 2;
+            points.forEach((point, index) => {
+                if (index === 0) {
+                    ctx.moveTo(point.x, point.y);
+                } else {
+                    ctx.lineTo(point.x, point.y);
+                }
+            });
+            ctx.stroke();
+
+            ctx.fillStyle = color;
+            points.forEach(point => {
+                ctx.beginPath();
+                ctx.arc(point.x, point.y, 1.8, 0, Math.PI * 2);
+                ctx.fill();
+            });
+
+            ctx.save();
+            ctx.fillStyle = '#64748b';
+            ctx.font = '11px sans-serif';
+            ctx.textBaseline = 'top';
+            ctx.textAlign = 'center';
+            labels.forEach((label, index) => {
+                if (index % step !== 0 && index !== labels.length - 1) return;
+                const x = points[index] ? points[index].x : margin.left;
+                ctx.fillText(String(label), x, height - margin.bottom + 8);
+            });
+            ctx.restore();
+        }
+
+        function drawBarFallback(canvasId, labels, values, color) {
+            const canvas = document.getElementById(canvasId);
+            if (!canvas) return;
+            const { ctx, width, height } = clearCanvas(canvas);
+            const margin = { top: 18, right: 18, bottom: 40, left: 48 };
+            const plotWidth = width - margin.left - margin.right;
+            const plotHeight = height - margin.top - margin.bottom;
+            const nums = values.map(v => Number(v) || 0);
+            const maxValue = Math.max(1, ...nums);
+            const step = nums.length > 12 ? Math.ceil(nums.length / 10) : 1;
+            const barWidth = nums.length > 0 ? plotWidth / nums.length : plotWidth;
+
+            drawGridAxes(ctx, width, height, margin, maxValue, 5);
+
+            ctx.fillStyle = color;
+            nums.forEach((value, index) => {
+                const scaledHeight = (value / maxValue) * plotHeight;
+                const x = margin.left + index * barWidth + Math.max(0, barWidth * 0.12);
+                const y = margin.top + plotHeight - scaledHeight;
+                ctx.fillRect(x, y, Math.max(1, barWidth * 0.76), scaledHeight);
+            });
+
+            ctx.save();
+            ctx.fillStyle = '#64748b';
+            ctx.font = '11px sans-serif';
+            ctx.textBaseline = 'top';
+            ctx.textAlign = 'center';
+            labels.forEach((label, index) => {
+                if (index % step !== 0 && index !== labels.length - 1) return;
+                const x = margin.left + index * barWidth + barWidth / 2;
+                ctx.fillText(String(label), x, height - margin.bottom + 8);
+            });
+            ctx.restore();
+        }
+
+        function drawDoughnutFallback(canvasId, labels, values, colors) {
+            const canvas = document.getElementById(canvasId);
+            if (!canvas) return;
+            const { ctx, width, height } = clearCanvas(canvas);
+            const nums = values.map(v => Math.max(0, Number(v) || 0));
+            const total = nums.reduce((sum, value) => sum + value, 0) || 1;
+            const radius = Math.max(36, Math.min(width, height) * 0.22);
+            const innerRadius = radius * 0.58;
+            const centerX = Math.min(width * 0.38, width / 2 - 24);
+            const centerY = height / 2;
+            let start = -Math.PI / 2;
+
+            nums.forEach((value, index) => {
+                const slice = (value / total) * Math.PI * 2;
+                ctx.beginPath();
+                ctx.moveTo(centerX, centerY);
+                ctx.arc(centerX, centerY, radius, start, start + slice);
+                ctx.closePath();
+                ctx.fillStyle = colors[index % colors.length];
+                ctx.fill();
+                start += slice;
+            });
+
+            ctx.globalCompositeOperation = 'destination-out';
+            ctx.beginPath();
+            ctx.arc(centerX, centerY, innerRadius, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.globalCompositeOperation = 'source-over';
+
+            const legendX = Math.max(centerX + radius + 18, width * 0.58);
+            const legendY = Math.max(18, height / 2 - (labels.length * 20) / 2);
+            ctx.font = '12px sans-serif';
+            ctx.textBaseline = 'middle';
+            labels.forEach((label, index) => {
+                const y = legendY + index * 22;
+                ctx.fillStyle = colors[index % colors.length];
+                ctx.fillRect(legendX, y - 6, 12, 12);
+                ctx.fillStyle = '#1e293b';
+                ctx.fillText(String(label), legendX + 18, y);
+            });
+        }
+
+        function drawFastqChartsFallback(m) {
+            if (m.gc_hist) {
+                drawLineFallback('fastqGcChart', Object.keys(m.gc_hist), Object.values(m.gc_hist), '#2563eb', true);
+            }
+            if (m.mean_quality_hist) {
+                drawBarFallback('fastqQualChart', Object.keys(m.mean_quality_hist), Object.values(m.mean_quality_hist), '#10b981');
+            }
+        }
+
+        function drawAlignChartsFallback(m) {
+            if (m.insert_size_hist) {
+                drawLineFallback('alignInsertChart', Object.keys(m.insert_size_hist), Object.values(m.insert_size_hist), '#2563eb', true);
+            }
+            if (m.mapq_hist) {
+                drawBarFallback('alignMapqChart', Object.keys(m.mapq_hist), Object.values(m.mapq_hist), '#1e293b');
+            }
+        }
+
+        function drawDnaChartsFallback(m) {
+            if (m.depth_hist) {
+                drawBarFallback('dnaDepthChart', Object.keys(m.depth_hist), Object.values(m.depth_hist), '#2563eb');
+            }
+            const tbody = document.getElementById('dnaBreadthTable');
+            tbody.innerHTML = `
+                <tr><td>1x</td><td>${(m.breadth_1x * 100).toFixed(2)}%</td></tr>
+                <tr><td>5x</td><td>${(m.breadth_5x * 100).toFixed(2)}%</td></tr>
+                <tr><td>10x</td><td>${(m.breadth_10x * 100).toFixed(2)}%</td></tr>
+                <tr><td>20x</td><td>${(m.breadth_20x * 100).toFixed(2)}%</td></tr>
+                <tr><td>30x</td><td>${(m.breadth_30x * 100).toFixed(2)}%</td></tr>
+            `;
+        }
+
+        function drawRnaChartsFallback(m) {
+            drawDoughnutFallback(
+                'rnaDistChart',
+                ['Exonic', 'Intronic', 'Flanking', 'Intergenic'],
+                [m.exonic_reads, m.intronic_reads, m.flanking_reads, m.intergenic_reads],
+                ['#10b981', '#f59e0b', '#3b82f6', '#94a3b8']
+            );
+
+            const tbody = document.getElementById('rnaJunctionTable');
+            tbody.innerHTML = `
+                <tr><td>Known Junctions</td><td>${m.unique_known_junctions || 0}</td><td>${m.total_known_junction_reads || 0}</td></tr>
+                <tr><td>Partial Novel Junctions</td><td>${m.unique_partial_novel_junctions || 0}</td><td>${m.total_partial_novel_junction_reads || 0}</td></tr>
+                <tr><td>Fully Novel Junctions</td><td>${m.unique_novel_junctions || 0}</td><td>${m.total_novel_junction_reads || 0}</td></tr>
+            `;
+
+            const snapGrid = document.getElementById('rnaSnapshotsGrid');
+            snapGrid.innerHTML = '';
+            const rnaSection = reportData.sections.find(s => s.module === 'rna');
+            if (!rnaSection) return;
+            const baseName = rnaSection.source.substring(rnaSection.source.lastIndexOf('/') + 1);
+            const prefix = baseName.split('.')[0];
+            const snaps = [
+                { gene: 'GAPDH', file: `${prefix}.GAPDH.png`, reason: 'Housekeeping Gene Body' }
+            ];
+            snaps.forEach(s => {
+                const card = document.createElement('div');
+                card.className = 'snapshot-card';
+                card.innerHTML = `<a href="./snapshots/${s.file}" target="_blank">${s.gene} Snapshot</a><span class="meta">${s.reason}</span>`;
+                snapGrid.appendChild(card);
+            });
+        }
+
+        function renderActiveTabCharts(tabId) {
+            const sample = document.getElementById('sampleSelect').value;
+            const sections = reportData.sections.filter(s => s.sample === sample);
+
+            if (typeof Chart === 'undefined') {
+                if (tabId === 'fastq') {
+                    const sec = sections.find(s => s.module === 'fastq');
+                    if (sec) drawFastqChartsFallback(sec.metrics);
+                } else if (tabId === 'align') {
+                    const sec = sections.find(s => s.module === 'align');
+                    if (sec) drawAlignChartsFallback(sec.metrics);
+                } else if (tabId === 'dna') {
+                    const sec = sections.find(s => s.module === 'dna');
+                    if (sec) drawDnaChartsFallback(sec.metrics);
+                } else if (tabId === 'rna') {
+                    const sec = sections.find(s => s.module === 'rna');
+                    if (sec) drawRnaChartsFallback(sec.metrics);
+                }
+                return;
+            }
+
+            if (tabId === 'fastq') {
+                const sec = sections.find(s => s.module === 'fastq');
+                if (sec) drawFastqCharts(sec.metrics);
+            } else if (tabId === 'align') {
+                const sec = sections.find(s => s.module === 'align');
+                if (sec) drawAlignCharts(sec.metrics);
+            } else if (tabId === 'dna') {
+                const sec = sections.find(s => s.module === 'dna');
+                if (sec) drawDnaCharts(sec.metrics);
+            } else if (tabId === 'rna') {
+                const sec = sections.find(s => s.module === 'rna');
+                if (sec) drawRnaCharts(sec.metrics);
+            }
+        }
+        </script>"##,
     );
 
     out.push_str("</body></html>");
@@ -1192,5 +1523,25 @@ mod tests {
 
         env::set_current_dir(cwd).expect("restore cwd");
         fs::remove_dir_all(tmp.path()).ok();
+    }
+
+    #[test]
+    fn render_html_includes_offline_chart_fallbacks() {
+        let document = ReportDocument {
+            title: "demo".to_string(),
+            generated_by: "test".to_string(),
+            sections: vec![ReportSection {
+                module: "fastq".to_string(),
+                sample: "sample".to_string(),
+                source: "/tmp/sample.fastq.summary.json".to_string(),
+                metrics: json!({"gc_hist": {"0": 1}, "mean_quality_hist": {"10": 2}}),
+            }],
+        };
+
+        let html = render_html(&document);
+        assert!(html.contains("function drawLineFallback"));
+        assert!(html.contains("function drawBarFallback"));
+        assert!(html.contains("function drawDoughnutFallback"));
+        assert!(html.contains("function renderActiveTabCharts(tabId)"));
     }
 }
