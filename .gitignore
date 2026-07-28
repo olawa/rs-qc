@@ -1,4 +1,6 @@
 upal*
+hg002*
+fastq*
 /data/
 /RSeQC/
 /tests/
@@ -8,3 +10,4 @@ upal*
 *.snap.svg
 *.report.html
 *.summary.json
+UPAL*
